@@ -12,6 +12,6 @@ jobs:
     - uses: actions/checkout@v2
       with:
         submodules: true
-    - run: "sudo apt-get install libfuse-dev fuse3-dev fuse3 libfuse3-dev libfuse-3-dev libfuse-3 fuse-3-dev fuse-3 lis	|| true"
+    - run: "sudo apt-get install libfuse-dev || true"
     - run: make all
     - run: make test

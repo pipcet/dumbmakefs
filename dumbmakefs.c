@@ -55,6 +55,17 @@
 
 #include "passthrough_helpers.h"
 
+int my_dirfd;
+
+static void create_file_if_necessary (const char *path)
+{
+  if (faccessat (my_dirfd, path, F_OK, 0) == 0)
+    return;
+
+  fprintf (stderr, "trying to create %s\n", path);
+  sleep (1);
+}
+
 static void *xmp_init(struct fuse_conn_info *conn,
 		      struct fuse_config *cfg)
 {
@@ -81,7 +92,8 @@ static int xmp_getattr(const char *path, struct stat *stbuf,
 	(void) fi;
 	int res;
 
-	res = lstat(path, stbuf);
+	create_file_if_necessary (path);
+	res = fstatat (my_dirfd, path, stbuf, 0);
 	if (res == -1)
 		return -errno;
 
@@ -92,7 +104,8 @@ static int xmp_access(const char *path, int mask)
 {
 	int res;
 
-	res = access(path, mask);
+	create_file_if_necessary (path);
+	res = faccessat (my_dirfd, path, mask, 0);
 	if (res == -1)
 		return -errno;
 
@@ -103,7 +116,8 @@ static int xmp_readlink(const char *path, char *buf, size_t size)
 {
 	int res;
 
-	res = readlink(path, buf, size - 1);
+	create_file_if_necessary (path);
+	res = readlinkat (my_dirfd, path, buf, size - 1);
 	if (res == -1)
 		return -errno;
 
@@ -123,7 +137,8 @@ static int xmp_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	(void) fi;
 	(void) flags;
 
-	dp = opendir(path);
+	create_file_if_necessary (path);
+	dp = fdopendir (openat (my_dirfd, path, O_DIRECTORY));
 	if (dp == NULL)
 		return -errno;
 
@@ -142,12 +157,6 @@ static int xmp_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 
 static int xmp_mknod(const char *path, mode_t mode, dev_t rdev)
 {
-	int res;
-
-	res = mknod_wrapper(AT_FDCWD, path, NULL, mode, rdev);
-	if (res == -1)
-		return -errno;
-
 	return 0;
 }
 
@@ -155,7 +164,8 @@ static int xmp_mkdir(const char *path, mode_t mode)
 {
 	int res;
 
-	res = mkdir(path, mode);
+	create_file_if_necessary (path);
+	res = mkdirat(my_dirfd, path, mode);
 	if (res == -1)
 		return -errno;
 
@@ -166,7 +176,8 @@ static int xmp_unlink(const char *path)
 {
 	int res;
 
-	res = unlink(path);
+	create_file_if_necessary (path);
+	res = unlinkat(my_dirfd, path, 0);
 	if (res == -1)
 		return -errno;
 
@@ -177,7 +188,8 @@ static int xmp_rmdir(const char *path)
 {
 	int res;
 
-	res = rmdir(path);
+	create_file_if_necessary (path);
+	res = unlinkat(my_dirfd, path, AT_REMOVEDIR);
 	if (res == -1)
 		return -errno;
 
@@ -188,7 +200,8 @@ static int xmp_symlink(const char *from, const char *to)
 {
 	int res;
 
-	res = symlink(from, to);
+	create_file_if_necessary (to);
+	res = symlinkat(from, my_dirfd, to);
 	if (res == -1)
 		return -errno;
 
@@ -202,7 +215,9 @@ static int xmp_rename(const char *from, const char *to, unsigned int flags)
 	if (flags)
 		return -EINVAL;
 
-	res = rename(from, to);
+	create_file_if_necessary (from);
+	create_file_if_necessary (to);
+	res = renameat(my_dirfd, from, my_dirfd, to);
 	if (res == -1)
 		return -errno;
 
@@ -213,7 +228,9 @@ static int xmp_link(const char *from, const char *to)
 {
 	int res;
 
-	res = link(from, to);
+	create_file_if_necessary (from);
+	create_file_if_necessary (to);
+	res = linkat(my_dirfd, from, my_dirfd, to, 0);
 	if (res == -1)
 		return -errno;
 
@@ -226,7 +243,8 @@ static int xmp_chmod(const char *path, mode_t mode,
 	(void) fi;
 	int res;
 
-	res = chmod(path, mode);
+	create_file_if_necessary (path);
+	res = fchmodat(my_dirfd, path, mode, 0);
 	if (res == -1)
 		return -errno;
 
@@ -237,12 +255,8 @@ static int xmp_chown(const char *path, uid_t uid, gid_t gid,
 		     struct fuse_file_info *fi)
 {
 	(void) fi;
-	int res;
 
-	res = lchown(path, uid, gid);
-	if (res == -1)
-		return -errno;
-
+	create_file_if_necessary (path);
 	return 0;
 }
 
@@ -251,10 +265,12 @@ static int xmp_truncate(const char *path, off_t size,
 {
 	int res;
 
-	if (fi != NULL)
-		res = ftruncate(fi->fh, size);
-	else
-		res = truncate(path, size);
+	create_file_if_necessary (path);
+	int fd = openat(my_dirfd, path, 0);
+	if (fd < 0)
+	  return -errno;
+	res = ftruncate(my_dirfd, fd);
+	close (fd);
 	if (res == -1)
 		return -errno;
 
@@ -282,7 +298,7 @@ static int xmp_create(const char *path, mode_t mode,
 {
 	int res;
 
-	res = open(path, fi->flags, mode);
+	res = openat(my_dirfd, path, fi->flags, mode, 0);
 	if (res == -1)
 		return -errno;
 
@@ -294,7 +310,7 @@ static int xmp_open(const char *path, struct fuse_file_info *fi)
 {
 	int res;
 
-	res = open(path, fi->flags);
+	res = openat(my_dirfd, path, fi->flags, 0, 0);
 	if (res == -1)
 		return -errno;
 
@@ -549,6 +565,8 @@ static const struct fuse_operations xmp_oper = {
 
 int main(int argc, char *argv[])
 {
-	umask(0);
-	return fuse_main(argc, argv, &xmp_oper, NULL);
+  my_dirfd = open ("build", O_DIRECTORY);
+  fprintf (stderr, "my_dirfd %d\n", my_dirfd);
+  umask(0);
+  return fuse_main(argc, argv, &xmp_oper, NULL);
 }

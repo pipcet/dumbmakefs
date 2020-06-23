@@ -1,0 +1,3 @@
+[submodule "dumbmake"]
+	path = dumbmake
+	url = https://github.com/pipcet/make

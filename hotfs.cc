@@ -275,14 +275,9 @@ static void do_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
     if (fi)
       res = futimens(fi->fh, tv);
     else {
-#ifdef HAVE_UTIMENSAT
       char procname[64];
       sprintf(procname, "/proc/self/fd/%i", ifd);
       res = utimensat(AT_FDCWD, procname, tv, 0);
-#else
-      res = -1;
-      errno = EOPNOTSUPP;
-#endif
     }
     if (res == -1)
       goto out_err;

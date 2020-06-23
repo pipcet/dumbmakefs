@@ -87,9 +87,9 @@ using namespace std;
    must be able to store pointer a pointer in both a fuse_ino_t
    variable and a uint64_t variable (used for file handles). */
 static_assert(sizeof(fuse_ino_t) >= sizeof(void*),
-              "void* must fit into fuse_ino_t");
+	      "void* must fit into fuse_ino_t");
 static_assert(sizeof(fuse_ino_t) >= sizeof(uint64_t),
-              "fuse_ino_t must be at least 64 bits");
+	      "fuse_ino_t must be at least 64 bits");
 
 
 /* Forward declarations */
@@ -218,7 +218,7 @@ static void sfs_getattr(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi) {
 
 
 static void do_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
-                       int valid, struct fuse_file_info* fi) {
+		       int valid, struct fuse_file_info* fi) {
   Inode& inode = get_inode(ino);
   int ifd = inode.fd;
   int res;
@@ -294,14 +294,14 @@ static void do_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
 
 
 static void sfs_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
-                        int valid, fuse_file_info *fi) {
+			int valid, fuse_file_info *fi) {
   (void) ino;
   do_setattr(req, ino, attr, valid, fi);
 }
 
 
 static int do_lookup(fuse_ino_t parent, const char *name,
-                     fuse_entry_param *e) {
+		     fuse_entry_param *e) {
   if (fs.debug)
     cerr << "DEBUG: lookup(): name=" << name
 	 << ", parent=" << parent << endl;
@@ -422,25 +422,25 @@ static void mknod_symlink(fuse_req_t req, fuse_ino_t parent,
 
 
 static void sfs_mknod(fuse_req_t req, fuse_ino_t parent, const char *name,
-                      mode_t mode, dev_t rdev) {
+		      mode_t mode, dev_t rdev) {
   mknod_symlink(req, parent, name, mode, rdev, nullptr);
 }
 
 
 static void sfs_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name,
-                      mode_t mode) {
+		      mode_t mode) {
   mknod_symlink(req, parent, name, S_IFDIR | mode, 0, nullptr);
 }
 
 
 static void sfs_symlink(fuse_req_t req, const char *link, fuse_ino_t parent,
-                        const char *name) {
+			const char *name) {
   mknod_symlink(req, parent, name, S_IFLNK, 0, link);
 }
 
 
 static void sfs_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t parent,
-                     const char *name) {
+		     const char *name) {
   Inode& inode = get_inode(ino);
   Inode& inode_p = get_inode(parent);
   fuse_entry_param e {};
@@ -481,8 +481,8 @@ static void sfs_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name) {
 
 
 static void sfs_rename(fuse_req_t req, fuse_ino_t parent, const char *name,
-                       fuse_ino_t newparent, const char *newname,
-                       unsigned int flags) {
+		       fuse_ino_t newparent, const char *newname,
+		       unsigned int flags) {
   Inode& inode_p = get_inode(parent);
   Inode& inode_np = get_inode(newparent);
   if (flags) {
@@ -532,7 +532,7 @@ static void sfs_forget(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup) {
 
 
 static void sfs_forget_multi(fuse_req_t req, size_t count,
-                             fuse_forget_data *forgets) {
+			     fuse_forget_data *forgets) {
   for (int i = 0; i < count; i++)
     forget_one(forgets[i].ino, forgets[i].nlookup);
   fuse_reply_none(req);
@@ -723,14 +723,14 @@ static void do_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
 
 
 static void sfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
-                        off_t offset, fuse_file_info *fi) {
+			off_t offset, fuse_file_info *fi) {
   // operation logging is done in readdir to reduce code duplication
   do_readdir(req, ino, size, offset, fi, 0);
 }
 
 
 static void sfs_readdirplus(fuse_req_t req, fuse_ino_t ino, size_t size,
-                            off_t offset, fuse_file_info *fi) {
+			    off_t offset, fuse_file_info *fi) {
   // operation logging is done in readdir to reduce code duplication
   do_readdir(req, ino, size, offset, fi, 1);
 }
@@ -745,7 +745,7 @@ static void sfs_releasedir(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi) {
 
 
 static void sfs_create(fuse_req_t req, fuse_ino_t parent, const char *name,
-                       mode_t mode, fuse_file_info *fi) {
+		       mode_t mode, fuse_file_info *fi) {
   Inode& inode_p = get_inode(parent);
 
   auto fd = openat(inode_p.fd, name,
@@ -771,7 +771,7 @@ static void sfs_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 
 
 static void sfs_fsyncdir(fuse_req_t req, fuse_ino_t ino, int datasync,
-                         fuse_file_info *fi) {
+			 fuse_file_info *fi) {
   (void) ino;
   int res;
   int fd = dirfd(get_dir_handle(fi)->dp);
@@ -836,7 +836,7 @@ static void sfs_flush(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi) {
 
 
 static void sfs_fsync(fuse_req_t req, fuse_ino_t ino, int datasync,
-                      fuse_file_info *fi) {
+		      fuse_file_info *fi) {
   (void) ino;
   int res;
   if (datasync)
@@ -859,14 +859,14 @@ static void do_read(fuse_req_t req, size_t size, off_t off, fuse_file_info *fi) 
 }
 
 static void sfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
-                     fuse_file_info *fi) {
+		     fuse_file_info *fi) {
   (void) ino;
   do_read(req, size, off, fi);
 }
 
 
 static void do_write_buf(fuse_req_t req, size_t size, off_t off,
-                         fuse_bufvec *in_buf, fuse_file_info *fi) {
+			 fuse_bufvec *in_buf, fuse_file_info *fi) {
   fuse_bufvec out_buf = FUSE_BUFVEC_INIT(size);
   out_buf.buf[0].flags = static_cast<fuse_buf_flags>(
 						     FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK);
@@ -882,7 +882,7 @@ static void do_write_buf(fuse_req_t req, size_t size, off_t off,
 
 
 static void sfs_write_buf(fuse_req_t req, fuse_ino_t ino, fuse_bufvec *in_buf,
-                          off_t off, fuse_file_info *fi) {
+			  off_t off, fuse_file_info *fi) {
   (void) ino;
   auto size {fuse_buf_size(in_buf)};
   do_write_buf(req, size, off, in_buf, fi);
@@ -902,7 +902,7 @@ static void sfs_statfs(fuse_req_t req, fuse_ino_t ino) {
 
 #ifdef HAVE_POSIX_FALLOCATE
 static void sfs_fallocate(fuse_req_t req, fuse_ino_t ino, int mode,
-                          off_t offset, off_t length, fuse_file_info *fi) {
+			  off_t offset, off_t length, fuse_file_info *fi) {
   (void) ino;
   if (mode) {
     fuse_reply_err(req, EOPNOTSUPP);
@@ -915,7 +915,7 @@ static void sfs_fallocate(fuse_req_t req, fuse_ino_t ino, int mode,
 #endif
 
 static void sfs_flock(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi,
-                      int op) {
+		      int op) {
   (void) ino;
   auto res = flock(fi->fh, op);
   fuse_reply_err(req, res == -1 ? errno : 0);
@@ -924,7 +924,7 @@ static void sfs_flock(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi,
 
 #ifdef HAVE_SETXATTR
 static void sfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
-                         size_t size) {
+			 size_t size) {
   char *value = nullptr;
   Inode& inode = get_inode(ino);
   ssize_t ret;
@@ -1010,7 +1010,7 @@ static void sfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size) {
 
 
 static void sfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
-                         const char *value, size_t size, int flags) {
+			 const char *value, size_t size, int flags) {
   Inode& inode = get_inode(ino);
   ssize_t ret;
   int saverr;

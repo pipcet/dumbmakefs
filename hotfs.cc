@@ -124,7 +124,8 @@ struct Inode {
   dev_t src_dev {0};
   ino_t src_ino {0};
   uint64_t nlookup {0};
-  
+  const char *toplevelpath {0};
+
   std::mutex m;
 
   // Delete copy constructor and assignments. We could implement
@@ -302,6 +303,8 @@ static void sfs_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
 
 static int do_lookup(fuse_ino_t parent, const char *name,
 		     fuse_entry_param *e) {
+  char *fullpath;
+  asprintf (&fullpath, "%s/%s", get_inode(parent).toplevelpath ? : ".", name);
   if (fs.debug)
     cerr << "DEBUG: lookup(): name=" << name
 	 << ", parent=" << parent << endl;
@@ -309,9 +312,19 @@ static int do_lookup(fuse_ino_t parent, const char *name,
   e->attr_timeout = fs.timeout;
   e->entry_timeout = fs.timeout;
 
+  int attempt = 0;
+ again:
   auto newfd = openat(get_fs_fd(parent), name, O_PATH | O_NOFOLLOW);
-  if (newfd == -1)
+  if (newfd == -1) {
+    cout << "cannot find file at " << fullpath << endl;
+    if (attempt++ == 0) {
+      char *cmd;
+      asprintf (&cmd, "cd test; make %s", fullpath+2);
+      system(cmd);
+      goto again;
+    }
     return errno;
+  }
 
   auto res = fstatat(newfd, "", &e->attr, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
   if (res == -1) {
@@ -360,6 +373,7 @@ static int do_lookup(fuse_ino_t parent, const char *name,
     inode.src_dev = e->attr.st_dev;
     inode.nlookup = 1;
     inode.fd = newfd;
+    inode.toplevelpath = fullpath;
     fs_lock.unlock();
 
     if (fs.debug)

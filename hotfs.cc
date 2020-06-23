@@ -68,6 +68,8 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <limits.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 
 // C++ includes
 #include <cstddef>
@@ -146,6 +148,7 @@ struct Fs {
   // Must be acquired *after* any Inode.m locks.
   std::mutex mutex;
   InodeMap inodes; // protected by mutex
+  std::unordered_map<std::string, int> making;
   Inode root;
   double timeout;
   bool debug;
@@ -295,7 +298,6 @@ static void sfs_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
   do_setattr(req, ino, attr, valid, fi);
 }
 
-
 static int do_lookup(fuse_ino_t parent, const char *name,
 		     fuse_entry_param *e) {
   char *fullpath;
@@ -311,11 +313,27 @@ static int do_lookup(fuse_ino_t parent, const char *name,
  again:
   auto newfd = openat(get_fs_fd(parent), name, O_PATH | O_NOFOLLOW);
   if (newfd == -1) {
-    cout << "cannot find file at " << fullpath << endl;
-    if (attempt++ == 0) {
-      char *cmd;
-      asprintf (&cmd, "cd cold; make %s", fullpath+2);
-      system(cmd);
+    unique_lock<mutex> fs_lock {fs.mutex};
+    std::string str(fullpath);
+    int making = fs.making[str];
+    cout << "cannot find file at " << fullpath << ": " << making << endl;
+    sleep (1);
+    if (making == 0) {
+      fs.making[str] = 1;
+      pid_t pid = fork();
+      if (pid) {
+	fs.making[str] = pid;
+      } else {
+	char *cmd;
+	asprintf (&cmd, "cd cold; make %s", fullpath+2);
+	system(cmd);
+	free (cmd);
+	exit(0);
+      }
+      goto again;
+    } else if (making > 0) {
+      waitpid(making, 0, 0);
+      fs.making[str] = -1;
       goto again;
     }
     return errno;

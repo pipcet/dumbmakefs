@@ -7,11 +7,11 @@ on:
 jobs:
   all:
     name: make all
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-20.04
     steps:
     - uses: actions/checkout@v2
       with:
         submodules: true
-    - run: "sudo apt-get install libfuse-dev || true"
+    - run: "sudo apt-get install libfuse-dev libfuse3-dev || true"
     - run: make all
     - run: make test

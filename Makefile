@@ -7,13 +7,13 @@ all: hotfs.exe
 	g++ -Wall -O0 -g3 $< `pkg-config fuse3 --cflags --libs` -o $@
 
 test: hotfs.exe
-	mkdir build
-	mkdir test
-	touch build/mounted
-	echo "a: b ; echo hello world > a" > build/Makefile
-	./hotfs.exe build test &
-	while ! [ -e test/mounted ]; do sleep 1; done
-	touch test/b || true
-	cat test/a
-	umount test
+	mkdir hot
+	mkdir cold
+	touch cold/mounted
+	echo "a: b ; echo hello world > a" > cold/Makefile
+	./hotfs.exe cold hot &
+	while ! [ -e hot/mounted ]; do sleep 1; done
+	touch hot/b
+	cat hot/a
+	umount hot
 

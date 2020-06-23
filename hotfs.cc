@@ -314,7 +314,7 @@ static int do_lookup(fuse_ino_t parent, const char *name,
     cout << "cannot find file at " << fullpath << endl;
     if (attempt++ == 0) {
       char *cmd;
-      asprintf (&cmd, "cd build; make %s", fullpath+2);
+      asprintf (&cmd, "cd cold; make %s", fullpath+2);
       system(cmd);
       goto again;
     }

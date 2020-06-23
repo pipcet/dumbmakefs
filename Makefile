@@ -13,7 +13,7 @@ test: hotfs.exe
 	echo "a: b ; echo hello world > a" > build/Makefile
 	./hotfs.exe build test &
 	while ! [ -e test/mounted ]; do sleep 1; done
-	touch test/b
+	touch test/b || true
 	cat test/a
 	umount test
 

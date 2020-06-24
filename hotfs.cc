@@ -325,7 +325,7 @@ static int do_lookup(fuse_ino_t parent, const char *name,
 	fs.making[str] = pid;
       } else {
 	char *cmd;
-	asprintf (&cmd, "cd cold; make %s", fullpath+2);
+	asprintf (&cmd, "cd cold; make -j10 %s", fullpath+2);
 	system(cmd);
 	free (cmd);
 	exit(0);

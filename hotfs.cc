@@ -134,14 +134,23 @@ public:
 
 public:
   FullInode(int dir_fd) : dir_fd(dir_fd) {
+    if (dir_fd == -1)
+      abort();
     get_log_fd();
+    this->get_cold_fd();
   }
+  FullInode (int fd, const char *path) : FullInode (::openat(fd, path, 0, 0770)) {}
 
   virtual int get_cold_fd()
   {
     if (cold_fd == -1)
       cold_fd = ::openat(dir_fd, "cold", O_RDWR|O_CREAT, 0660);
 
+    if (cold_fd == -1)
+      cold_fd = ::openat(dir_fd, "cold", O_DIRECTORY, 0660);
+
+    if (cold_fd == -1)
+      abort ();
     get_log_fd();
     return cold_fd;
   }
@@ -212,6 +221,7 @@ struct FullDirInode : public FullInode {
   }
 
   FullDirInode (int fd) : FullInode (fd) {}
+  FullDirInode (int fd, const char *path) : FullInode (::openat(fd, path, 0, 0770)) {}
 };
 
 struct Inode {
@@ -254,7 +264,33 @@ struct Inode {
 };
 
 struct DirInode : public Inode {
-  DirInode(FullInode *full) { this->full = full; }
+  DirInode(FullInode *full) {
+    this->full = full;
+  }
+
+  virtual Inode* lookup(const char *name, fuse_entry_param *e)
+  {
+    char *path;
+    asprintf(&path, "%s/cold", name);
+    auto res = fstatat(full->get_cold_fd (), path, &e->attr,
+		       AT_SYMLINK_NOFOLLOW);
+
+    if (res < 0) {
+      free(path);
+      return nullptr;
+    }
+
+    if (S_ISDIR (e->attr.st_mode)) {
+      Inode *ret = new DirInode(new FullDirInode (full->get_cold_fd(), name));
+      free(path);
+      return ret;
+    } else {
+      Inode *ret = new Inode();
+      ret->full = new FullInode (full->get_cold_fd(), name);
+      free(path);
+      return ret;
+    }
+  }
 };
 struct FileInode : public Inode {};
 struct MetaInode : public DirInode {
@@ -879,8 +915,24 @@ static void sfs_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 		       mode_t mode, fuse_file_info *fi) {
   Inode& inode_p = get_inode(parent);
 
-  auto fd = openat(inode_p.get_cold_fd(), name,
+  if (mkdirat(inode_p.get_cold_fd(), name, 0770) < 0) {
+    auto err = errno;
+    if (err == ENFILE || err == EMFILE)
+      cerr << "ERROR: Reached maximum number of file descriptors." << endl;
+    fuse_reply_err(req, err);
+    return;
+  }
+  int dir_fd = openat(inode_p.get_cold_fd(), name, O_DIRECTORY, 0);
+  if (dir_fd < 0) {
+    auto err = errno;
+    if (err == ENFILE || err == EMFILE)
+      cerr << "ERROR: Reached maximum number of file descriptors." << endl;
+    fuse_reply_err(req, err);
+    return;
+  }
+  auto fd = openat(dir_fd, "cold",
 		   (fi->flags | O_CREAT) & ~O_NOFOLLOW, mode);
+  close (dir_fd);
   if (fd == -1) {
     auto err = errno;
     if (err == ENFILE || err == EMFILE)
@@ -901,16 +953,8 @@ static void sfs_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 }
 
 
-static void sfs_fsyncdir(fuse_req_t req, fuse_ino_t ino, int datasync,
-			 fuse_file_info *fi) {
-  (void) ino;
-  int res;
-  int fd = dirfd(get_dir_handle(fi)->dp);
-  if (datasync)
-    res = fdatasync(fd);
-  else
-    res = fsync(fd);
-  fuse_reply_err(req, res == -1 ? errno : 0);
+static void sfs_fsyncdir(fuse_req_t req, fuse_ino_t, int, fuse_file_info *) {
+  fuse_reply_err (req, 0);
 }
 
 
@@ -933,11 +977,7 @@ static void sfs_open(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi) {
   if (fs.timeout && fi->flags & O_APPEND)
     fi->flags &= ~O_APPEND;
 
-  /* Unfortunately we cannot use inode.fd, because this was opened
-     with O_PATH (so it doesn't allow read/write access). */
-  char buf[64];
-  sprintf(buf, "/proc/self/fd/%i", inode.full->get_cold_fd());
-  auto fd = open(buf, fi->flags & ~O_NOFOLLOW);
+  auto fd = dup(inode.full->get_cold_fd());
   if (fd == -1) {
     auto err = errno;
     if (err == ENFILE || err == EMFILE)

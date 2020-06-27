@@ -194,8 +194,14 @@ public:
     if (creator == NULL)
       {
 	int fd = get_creator_fd ();
+	if (fd < 0)
+	  abort();
 	FILE *f = fdopen(dup(fd), "r");
+	if (f == NULL)
+	  abort();
 	fscanf (f, "%ms\n", &creator);
+	if (creator == NULL)
+	  abort();
 	fclose (f);
       }
     return creator;
@@ -494,6 +500,13 @@ struct HotDirInode : public DirInode {
 
   HotDirInode(ColdInode *cold) : DirInode (cold) {}
 
+  virtual bool modify()
+  {
+    if (strcmp (cold->get_creator (), get_tree()) == 0)
+      return Inode::modify();
+    return false;
+  }
+
   virtual Inode* file_inode(int fd, const char *name)
   {
     Inode* ret = new HotInode();
@@ -568,7 +581,6 @@ struct WorkDirInode : public DirInode {
 
   WorkDirInode(ColdInode *cold, const char *tree, const char *parent_tree)
     : DirInode(cold), tree(tree), parent_tree(parent_tree) {
-    cold->set_creator(tree);
   }
 
   virtual void finish_build() {
@@ -1454,6 +1466,11 @@ static void do_write_buf(fuse_req_t req, size_t size, off_t off,
 
 static void sfs_write_buf(fuse_req_t req, fuse_ino_t ino, fuse_bufvec *in_buf,
 			  off_t off, fuse_file_info *fi) {
+  Inode* inode = reinterpret_cast<Inode*>(ino);
+  if (!inode->modify()) {
+    fuse_reply_err(req, -EIO);
+    return;
+  }
   (void) ino;
   auto size {fuse_buf_size(in_buf)};
   do_write_buf(req, size, off, in_buf, fi);

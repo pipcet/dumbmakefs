@@ -8,41 +8,6 @@
   See the file COPYING.
 */
 
-/** @file
- *
- * This is a "high-performance" version of passthrough_ll.c. While
- * passthrough_ll.c is designed to be as simple as possible, this
- * example intended to be as efficient and correct as possible.
- *
- * passthrough_hp.cc mirrors a specified "source" directory under a
- * specified the mountpoint with as much fidelity and performance as
- * possible.
- *
- * If --nocache is specified, the source directory may be changed
- * directly even while mounted and the filesystem will continue
- * to work correctly.
- *
- * Without --nocache, the source directory is assumed to be modified
- * only through the passthrough filesystem. This enables much better
- * performance, but if changes are made directly to the source, they
- * may not be immediately visible under the mountpoint and further
- * access to the mountpoint may result in incorrect behavior,
- * including data-loss.
- *
- * On its own, this filesystem fulfills no practical purpose. It is
- * intended as a template upon which additional functionality can be
- * built.
- *
- * Unless --nocache is specified, is only possible to write to files
- * for which the mounting user has read permissions. This is because
- * the writeback cache requires the kernel to be able to issue read
- * requests for all files (which the passthrough filesystem cannot
- * satisfy if it can't read the file in the underlying filesystem).
- *
- * ## Source code ##
- * \include passthrough_hp.cc
- */
-
 #define FUSE_USE_VERSION 35
 
 #ifdef HAVE_CONFIG_H
@@ -101,28 +66,6 @@ static_assert(sizeof(fuse_ino_t) >= sizeof(uint64_t),
 struct Inode;
 static Inode& get_inode(fuse_ino_t ino);
 static void forget_one(fuse_ino_t ino, uint64_t n);
-
-// Uniquely identifies a file in the source directory tree. This could
-// be simplified to just ino_t since we require the source directory
-// not to contain any mountpoints. This hasn't been done yet in case
-// we need to reconsider this constraint (but relaxing this would have
-// the drawback that we can no longer re-use inode numbers, and thus
-// readdir() would need to do a full lookup() in order to report the
-// right inode number).
-typedef std::pair<ino_t, dev_t> SrcId;
-
-// Define a hash function for SrcId
-namespace std {
-  template<>
-  struct hash<SrcId> {
-    size_t operator()(const SrcId& id) const {
-      return hash<ino_t>{}(id.first) ^ hash<dev_t>{}(id.second);
-    }
-  };
-}
-
-// Maps files in the source directory tree to inodes
-typedef std::unordered_map<SrcId, Inode> InodeMap;
 
 struct FullInode {
 public:
@@ -892,7 +835,6 @@ struct RootInode : public DirInode {
 struct Fs {
   // Must be acquired *after* any Inode.m locks.
   std::mutex mutex;
-  InodeMap inodes; // protected by mutex
   std::unordered_map<std::string, int> making;
   RootInode *root;
   double timeout;
@@ -1235,7 +1177,6 @@ static void forget_one(fuse_ino_t ino, uint64_t n) {
     {
       lock_guard<mutex> g_fs {fs.mutex};
       l.unlock();
-      fs.inodes.erase({inode.src_ino, inode.src_dev});
     }
   } else if (fs.debug)
     cerr << "DEBUG: forget: inode " << inode.src_ino
@@ -1443,8 +1384,7 @@ static void sfs_fsync(fuse_req_t req, fuse_ino_t ino, int datasync,
 static void do_read(fuse_req_t req, size_t size, off_t off, fuse_file_info *fi) {
 
   fuse_bufvec buf = FUSE_BUFVEC_INIT(size);
-  buf.buf[0].flags = static_cast<fuse_buf_flags>(
-						 FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK);
+  buf.buf[0].flags = static_cast<fuse_buf_flags>(FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK);
   buf.buf[0].fd = fi->fh;
   buf.buf[0].pos = off;
 
@@ -1461,8 +1401,7 @@ static void sfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
 static void do_write_buf(fuse_req_t req, size_t size, off_t off,
 			 fuse_bufvec *in_buf, fuse_file_info *fi) {
   fuse_bufvec out_buf = FUSE_BUFVEC_INIT(size);
-  out_buf.buf[0].flags = static_cast<fuse_buf_flags>(
-						     FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK);
+  out_buf.buf[0].flags = static_cast<fuse_buf_flags>(FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK);
   out_buf.buf[0].fd = fi->fh;
   out_buf.buf[0].pos = off;
 

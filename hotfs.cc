@@ -250,6 +250,19 @@ public:
     ::close (::openat (fd, where, O_CREAT|O_RDWR, 0660));
   }
 
+  virtual bool visible(const char *where)
+  {
+    char *path;
+    asprintf (&path, "visible/%s", where);
+    int fd = ::openat (dir_fd, path, O_RDONLY);
+    free (path);
+    if (fd >= 0) {
+      close (fd);
+      return true;
+    }
+    return false;
+  }
+
   virtual ~FullInode()
   {
     log("file closed\n");
@@ -360,11 +373,12 @@ struct DirInode : public Inode {
     this->full = full;
   }
 
+  virtual Inode* file_inode(int fd, const char *name) { while (true); }
+  virtual Inode* dir_inode(FullDirInode *) { while (true); }
   virtual Inode* lookup(const char *name, fuse_entry_param *e,
 			CreateType create = CREATE_NONE)
   {
     char *path;
-    const char *creator = NULL;
     asprintf(&path, "%s/cold", name);
     auto res = fstatat(full->get_cold_fd (), path, &e->attr,
 		       AT_SYMLINK_NOFOLLOW);
@@ -378,30 +392,32 @@ struct DirInode : public Inode {
       ::close (::openat (full->get_cold_fd(), path, O_CREAT|O_RDWR, 0660));
       res = fstatat(full->get_cold_fd (), path, &e->attr,
 		    AT_SYMLINK_NOFOLLOW);
-      creator = "build";
+      return file_inode(full->get_cold_fd(), name);
     }
 
     free(path);
+
     if (res < 0) {
       return nullptr;
     }
 
+    if (!visible(name))
+      return nullptr;
+
     if (S_ISDIR (e->attr.st_mode)) {
-      Inode *ret = new DirInode(new FullDirInode (full->get_cold_fd(), name));
-      if (creator)
-	ret->full->set_creator (creator);
-      return ret;
+      return dir_inode(new FullDirInode (full->get_cold_fd(), name));
     } else {
-      Inode *ret = new Inode();
-      ret->full = new FullInode (full->get_cold_fd(), name);
-      if (creator)
-	ret->full->set_creator (creator);
-      return ret;
+      return file_inode(full->get_cold_fd(), name);
     }
   }
 
+  virtual const char* get_kind()
+  {
+    return nullptr;
+  }
+
   virtual bool visible(const char *name) {
-    return true;
+    return full->visible(get_kind());
   }
 
   virtual bool clash(const char *name) {
@@ -520,20 +536,6 @@ struct HotDirInode : public DirInode {
       return file_inode(full->get_cold_fd(), name);
     }
   }
-
-  virtual bool visible(const char *name) {
-    {
-      char *path;
-      asprintf (&path, "%s/visible/%s", name, get_kind());
-      int fd = openat (get_cold_fd (), path, O_RDONLY);
-      free (path);
-      if (fd >= 0) {
-	close (fd);
-	return true;
-      }
-    }
-    return false;
-  }
 };
 
 struct MetaInode : public DirInode {
@@ -544,6 +546,23 @@ struct BuildInode : public Inode {};
 struct BuildDirInode : public DirInode {
   const char *id;
   char *kind;
+
+  virtual Inode* file_inode(int fd, const char *name)
+  {
+    Inode* ret = new BuildInode();
+    ret->full = new FullInode (fd, name);
+    ret->full->set_creator(id);
+    ret->full->make_visible(id);
+    return ret;
+  }
+
+  virtual Inode* dir_inode(FullDirInode *full)
+  {
+    Inode* ret = new BuildDirInode(full, id);
+    ret->full->set_creator(id);
+    ret->full->make_visible(id);
+    return ret;
+  }
 
   virtual const char *get_kind()
   {

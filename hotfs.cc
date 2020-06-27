@@ -750,13 +750,26 @@ struct BuildsInode : public DirInode {
       return cache[std::string(name)];
     }
 
+    char *path;
+    asprintf (&path, "build/%s", name);
+    {
+      if (fstatat (cold->dir_fd, path, &e->attr, 0) >= 0) {
+	free (path);
+	return cache[std::string(name)] = new BuildInode(cold, strdup (name));
+      }
+    }
+
     if (create == CREATE_DIR)
       {
 	e->attr.st_ino = 1;
 	e->attr.st_mode = (DT_DIR << 12) | 0770;
+	::mkdirat (cold->dir_fd, "build", 0770);
+	::mkdirat (cold->dir_fd, path, 0770);
+	free (path);
 	return cache[std::string(name)] = new BuildInode(cold, strdup (name));
       }
 
+    free (path);
     return nullptr;
   }
 

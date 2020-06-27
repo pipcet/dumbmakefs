@@ -323,7 +323,7 @@ struct DirInode : public Inode {
       ::close (::openat (full->get_cold_fd(), path, O_CREAT|O_RDWR, 0660));
       res = fstatat(full->get_cold_fd (), path, &e->attr,
 		    AT_SYMLINK_NOFOLLOW);
-      creator = "hot";
+      creator = "build";
     }
 
     if (res < 0) {
@@ -448,25 +448,43 @@ struct HotDirInode : public DirInode {
   }
 
   virtual bool visible(char *name) {
-    char *path;
-    asprintf (&path, "%s/creator", name);
-    int fd = openat (get_cold_fd(), path, O_RDONLY);
-    char *creator = nullptr;
-    if (fd < 0) {
+    {
+      char *path;
+      asprintf (&path, "%s/visible", name);
+      int fd = openat (get_cold_fd (), path, O_RDONLY);
+      char *visib = nullptr;
       free (path);
-      return false;
+      if (fd >= 0) {
+	FILE *f = fdopen (fd, "r");
+	while (fscanf (f, "%ms", &visib) > 0) {
+	  if (strcmp (visib, "all") == 0) {
+	    free(visib);
+	    fclose (f);
+	    return true;
+	  }
+	  free (visib);
+	}
+	fclose (f);
+      }
     }
-    free (path);
-    FILE *f = fdopen (fd, "r");
-    fscanf (f, "%ms", &creator);
-    fclose (f);
-    if (creator == 0)
-      return false;
-    if (strcmp (creator, "hot")) {
-      free (creator);
-      return false;
+    {
+      char *path;
+      asprintf (&path, "%s/creator", name);
+      int fd = openat (get_cold_fd (), path, O_RDONLY);
+      if (fd >= 0) {
+	FILE *f = fdopen (fd, "r");
+	char *creator = nullptr;
+	fscanf (f, "%ms", &creator);
+	fclose (f);
+	if (creator == 0)
+	  return false;
+	if (strcmp (creator, "hot")) {
+	  free (creator);
+	  return false;
+	}
+	free (creator);
+      }
     }
-    free (creator);
     return true;
   }
 };
@@ -481,6 +499,13 @@ struct BuildDirInode : public DirInode {
   BuildDirInode(FullInode *full, uint64_t id) : DirInode(full), id(id) {
     char *creator;
     asprintf(&creator, "build %ld", id);
+    full->set_creator(creator);
+    free (creator);
+  }
+
+  virtual void finish_build() {
+    char *creator;
+    asprintf(&creator, "finished build %ld", id);
     full->set_creator(creator);
     free (creator);
   }
@@ -524,6 +549,7 @@ struct BuildsInode : public DirInode {
     fuse_reply_buf(req, ret, size);
     delete[] ret;
   }
+
   BuildsInode(FullInode *full) : DirInode(full) {
     full->set_creator("builds");
   }

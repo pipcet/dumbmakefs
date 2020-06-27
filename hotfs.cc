@@ -347,6 +347,10 @@ struct DirInode : public Inode {
     }
   }
 
+  virtual bool visible(char *name) {
+    return true;
+  }
+
   virtual void readdir(fuse_req_t req, size_t size,
 		       off_t offset, fuse_file_info *fi, int plus) {
     char *ret = new (nothrow) char[size];
@@ -377,6 +381,8 @@ struct DirInode : public Inode {
 	continue;
       }
       free (path);
+      if (!visible(entry->d_name))
+	continue;
       e.attr = statbuf;
       if (plus) {
 	entsize = fuse_add_direntry_plus (req, p, rem, entry->d_name, &e, count);
@@ -441,69 +447,27 @@ struct HotDirInode : public DirInode {
     }
   }
 
-  virtual void readdir(fuse_req_t req, size_t size,
-		       off_t offset, fuse_file_info *fi, int plus) {
-    char *ret = new (nothrow) char[size];
-    memset (ret, 0, size);
-    char *p = ret;
-    auto rem = size;
-
-    struct dirent *entry;
-    Inode& inode = *this;
-    DIR *dir = fdopendir (inode.get_cold_fd());
-
-    seekdir (dir, 0);
-    off_t count = 0;
-    while ((entry = ::readdir (dir))) {
-      if (count++ < offset)
-	continue;
-      size_t entsize;
-      fuse_entry_param e {};
-      if (is_dot_or_dotdot (entry->d_name))
-	continue;
-      if (entry->d_type != DT_DIR)
-	continue;
-      char *path;
-      asprintf (&path, "%s/cold", entry->d_name);
-      struct stat statbuf;
-      if (fstatat (inode.get_cold_fd(), path, &statbuf, 0) < 0) {
-	free (path);
-	continue;
-      }
+  virtual bool visible(char *name) {
+    char *path;
+    asprintf (&path, "%s/creator", name);
+    int fd = openat (get_cold_fd(), path, O_RDONLY);
+    char *creator = nullptr;
+    if (fd < 0) {
       free (path);
-      asprintf (&path, "%s/creator", entry->d_name);
-      int fd = openat (inode.get_cold_fd(), path, O_RDONLY);
-      char *creator = nullptr;
-      if (fd < 0) {
-	free (path);
-	continue;
-      }
-      free (path);
-      FILE *f = fdopen (fd, "r");
-      fscanf (f, "%ms", &creator);
-      fclose (f);
-      if (creator == 0)
-	continue;
-      if (strcmp (creator, "hot"))
-	continue;
-      e.attr = statbuf;
-      if (plus) {
-	entsize = fuse_add_direntry_plus (req, p, rem, entry->d_name, &e, count);
-	if (entsize > rem) {
-	  abort();
-	}
-      } else {
-	entsize = fuse_add_direntry(req, p, rem, entry->d_name, &e.attr, count);
-	if (entsize > rem) {
-	  abort();
-	}
-      }
-      p += entsize;
-      rem -= entsize;
+      return false;
     }
-    size = size - rem;
-    fuse_reply_buf(req, ret, size);
-    delete[] ret;
+    free (path);
+    FILE *f = fdopen (fd, "r");
+    fscanf (f, "%ms", &creator);
+    fclose (f);
+    if (creator == 0)
+      return false;
+    if (strcmp (creator, "hot")) {
+      free (creator);
+      return false;
+    }
+    free (creator);
+    return true;
   }
 };
 

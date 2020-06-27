@@ -194,11 +194,7 @@ public:
 
     if (visible_fd == -1)
       {
-	visible_fd = ::mkdirat(dir_fd, "visible", 0770);
-      }
-
-    if (visible_fd == -1)
-      {
+	::mkdirat(dir_fd, "visible", 0770);
 	visible_fd = ::openat(dir_fd, "visible", O_DIRECTORY, 0660);
       }
 
@@ -251,7 +247,7 @@ public:
   virtual void make_visible(const char *where)
   {
     int fd = get_visible_fd ();
-    ::close (::openat (fd, where, O_CREAT|O_RDWR));
+    ::close (::openat (fd, where, O_CREAT|O_RDWR, 0660));
   }
 
   virtual ~FullInode()
@@ -294,6 +290,13 @@ struct FullDirInode : public FullInode {
 
 struct Inode {
   FullInode *full;
+  struct stat attr;
+
+  virtual int get_error ()
+  {
+    return 0;
+  }
+
   int get_cold_fd()
   {
     return full->get_cold_fd();
@@ -305,6 +308,11 @@ struct Inode {
   void log(const char *msg)
   {
     full->log(msg);
+  }
+  virtual bool modify()
+  {
+    full->log("modified\n");
+    return true;
   }
   dev_t src_dev {0};
   ino_t src_ino {0};
@@ -329,6 +337,17 @@ struct Inode {
   }
 };
 
+struct ErrorInode : public Inode {
+  int error;
+  ErrorInode(int error) : error (error) {}
+  virtual int get_error ()
+  {
+    return error;
+  }
+};
+
+static std::unordered_map<int, Inode *>error_cache;
+
 enum CreateType { CREATE_NONE, CREATE_DIR, CREATE_FILE };
 
 static bool is_dot_or_dotdot(const char *name) {
@@ -351,6 +370,10 @@ struct DirInode : public Inode {
 		       AT_SYMLINK_NOFOLLOW);
 
     if (create == CREATE_FILE && res < 0) {
+      if (clash(name)) {
+	errno = EIO;
+	return nullptr;
+      }
       ::mkdirat (full->get_cold_fd (), name, 0770);
       ::close (::openat (full->get_cold_fd(), path, O_CREAT|O_RDWR, 0660));
       res = fstatat(full->get_cold_fd (), path, &e->attr,
@@ -358,8 +381,8 @@ struct DirInode : public Inode {
       creator = "build";
     }
 
+    free(path);
     if (res < 0) {
-      free(path);
       return nullptr;
     }
 
@@ -367,19 +390,26 @@ struct DirInode : public Inode {
       Inode *ret = new DirInode(new FullDirInode (full->get_cold_fd(), name));
       if (creator)
 	ret->full->set_creator (creator);
-      free(path);
       return ret;
     } else {
       Inode *ret = new Inode();
       ret->full = new FullInode (full->get_cold_fd(), name);
       if (creator)
 	ret->full->set_creator (creator);
-      free(path);
       return ret;
     }
   }
 
   virtual bool visible(const char *name) {
+    return true;
+  }
+
+  virtual bool clash(const char *name) {
+    fuse_entry_param e {};
+    Inode *inode = lookup (name, &e);
+    if (!inode)
+      return false;
+    std::cerr << "Name clash!\n";
     return true;
   }
 
@@ -438,47 +468,56 @@ struct HotDirInode : public DirInode {
   HotDirInode(FullInode *full) : DirInode (full) {
   }
 
+  virtual Inode* file_inode(int fd, const char *name)
+  {
+    Inode* ret = new HotInode();
+    ret->full = new FullInode (fd, name);
+    ret->full->set_creator("hot");
+    ret->full->make_visible("hot");
+    return ret;
+  }
+
+  virtual Inode* dir_inode(FullDirInode *full)
+  {
+    Inode* ret = new HotDirInode(full);
+    ret->full->set_creator("hot");
+    ret->full->make_visible("hot");
+    return ret;
+  }
+
   virtual Inode* lookup(const char *name, fuse_entry_param *e,
 			CreateType create = CREATE_NONE)
   {
-    if (!visible(name))
-      return nullptr;
     char *path;
-    const char *creator = NULL;
     asprintf(&path, "%s/cold", name);
     auto res = fstatat(full->get_cold_fd (), path, &e->attr,
 		       AT_SYMLINK_NOFOLLOW);
 
     if (create == CREATE_FILE && res < 0) {
+      if (clash(name)) {
+	errno = EIO;
+	return nullptr;
+      }
       ::mkdirat (full->get_cold_fd (), name, 0770);
       ::close (::openat (full->get_cold_fd(), path, O_CREAT|O_RDWR, 0660));
       res = fstatat(full->get_cold_fd (), path, &e->attr,
 		    AT_SYMLINK_NOFOLLOW);
-      creator = get_kind();
+      return file_inode(full->get_cold_fd(), name);
     }
 
+    free(path);
+
     if (res < 0) {
-      free(path);
       return nullptr;
     }
 
+    if (!visible(name))
+      return nullptr;
+
     if (S_ISDIR (e->attr.st_mode)) {
-      Inode *ret = new HotDirInode(new FullDirInode (full->get_cold_fd(), name));
-      if (creator) {
-	ret->full->set_creator (creator);
-	ret->full->make_visible ("hot");
-      }
-      free(path);
-      return ret;
+      return dir_inode(new FullDirInode (full->get_cold_fd(), name));
     } else {
-      Inode *ret = new HotInode();
-      ret->full = new FullInode (full->get_cold_fd(), name);
-      if (creator) {
-	ret->full->set_creator (creator);
-	ret->full->make_visible ("hot");
-      }
-      free(path);
-      return ret;
+      return file_inode(full->get_cold_fd(), name);
     }
   }
 

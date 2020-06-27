@@ -131,6 +131,7 @@ public:
   int dir_fd;
   int cold_fd {-1};
   int log_fd {-1};
+  int creator_fd {-1};
 
 public:
   FullInode(int dir_fd) : dir_fd(dir_fd) {
@@ -170,6 +171,16 @@ public:
     return log_fd;
   }
 
+  int get_creator_fd()
+  {
+    if (creator_fd == -1)
+      {
+	creator_fd = ::openat(dir_fd, "creator", O_RDWR|O_CREAT, 0660);
+      }
+
+    return creator_fd;
+  }
+
   void log(const char *msg)
   {
     size_t len = strlen(msg);
@@ -192,6 +203,27 @@ public:
     return ret;
   }
 
+  char *creator {0};
+  virtual const char *get_creator ()
+  {
+    if (creator == NULL)
+      {
+	int fd = get_creator_fd ();
+	FILE *f = fdopen(dup(fd), "r");
+	fscanf (f, "%ms\n", &creator);
+	fclose (f);
+      }
+    return creator;
+  }
+
+  virtual void set_creator(const char *str)
+  {
+    int fd = get_creator_fd ();
+    FILE *f = fdopen(dup(fd), "w+");
+    fprintf (f, "%s\n", str);
+    fclose (f);
+  }
+
   virtual ~FullInode()
   {
     log("file closed\n");
@@ -200,6 +232,10 @@ public:
       close (cold_fd);
     if (log_fd >= 0)
       close (log_fd);
+    if (creator_fd >= 0)
+      close (creator_fd);
+    if (creator)
+      free (creator);
   }
 };
 
@@ -241,14 +277,10 @@ struct Inode {
   dev_t src_dev {0};
   ino_t src_ino {0};
   uint64_t nlookup {0};
-  const char *toplevelpath {0};
+  char *toplevelpath {0};
 
   std::mutex m;
 
-  virtual Inode* lookup(const char *, fuse_entry_param *)
-  {
-    return nullptr;
-  }
   // Delete copy constructor and assignments. We could implement
   // move if we need it.
   Inode() = default;
@@ -257,23 +289,37 @@ struct Inode {
   Inode& operator=(Inode&& inode) = delete;
   Inode& operator=(const Inode&) = delete;
 
-  ~Inode() {
+  virtual ~Inode() {
     if(full != nullptr)
       delete full;
+    if (toplevelpath)
+      free (toplevelpath);
   }
 };
+
+enum CreateType { CREATE_NONE, CREATE_DIR, CREATE_FILE };
 
 struct DirInode : public Inode {
   DirInode(FullInode *full) {
     this->full = full;
   }
 
-  virtual Inode* lookup(const char *name, fuse_entry_param *e)
+  virtual Inode* lookup(const char *name, fuse_entry_param *e,
+			CreateType create = CREATE_NONE)
   {
     char *path;
+    const char *creator = NULL;
     asprintf(&path, "%s/cold", name);
     auto res = fstatat(full->get_cold_fd (), path, &e->attr,
 		       AT_SYMLINK_NOFOLLOW);
+
+    if (create == CREATE_FILE && res < 0) {
+      ::mkdirat (full->get_cold_fd (), name, 0770);
+      ::close (::openat (full->get_cold_fd(), path, O_CREAT|O_RDWR, 0660));
+      res = fstatat(full->get_cold_fd (), path, &e->attr,
+		    AT_SYMLINK_NOFOLLOW);
+      creator = "hot";
+    }
 
     if (res < 0) {
       free(path);
@@ -282,22 +328,33 @@ struct DirInode : public Inode {
 
     if (S_ISDIR (e->attr.st_mode)) {
       Inode *ret = new DirInode(new FullDirInode (full->get_cold_fd(), name));
+      if (creator)
+	ret->full->set_creator (creator);
       free(path);
       return ret;
     } else {
       Inode *ret = new Inode();
       ret->full = new FullInode (full->get_cold_fd(), name);
+      if (creator)
+	ret->full->set_creator (creator);
       free(path);
       return ret;
     }
   }
 };
-struct FileInode : public Inode {};
+
+struct HotInode : public Inode {};
+struct HotDirInode : public DirInode {};
+
+struct BuildInode : public Inode {};
+struct BuildDirInode : public DirInode {};
+
 struct MetaInode : public DirInode {
   MetaInode(FullInode *full) : DirInode(full) {}
 };
 struct RootInode : public DirInode {
-  virtual Inode* lookup (const char *name, fuse_entry_param *e)
+  virtual Inode* lookup (const char *name, fuse_entry_param *e,
+			 CreateType create = CREATE_NONE)
   {
     if (strcmp(name, "hot") == 0) {
       e->attr.st_mode = (DT_DIR << 12) | 0770;
@@ -310,7 +367,9 @@ struct RootInode : public DirInode {
 
     return nullptr;
   }
-  RootInode() : DirInode(nullptr) {}
+  RootInode(FullInode *full) : DirInode(full) {
+    full->set_creator("root");
+  }
 };
 
 struct Fs {
@@ -318,7 +377,7 @@ struct Fs {
   std::mutex mutex;
   InodeMap inodes; // protected by mutex
   std::unordered_map<std::string, int> making;
-  RootInode root;
+  RootInode *root;
   double timeout;
   bool debug;
   std::string source;
@@ -338,9 +397,17 @@ static Fs fs{};
 
 static Inode& get_inode(fuse_ino_t ino) {
   if (ino == FUSE_ROOT_ID)
-    return fs.root;
+    return *fs.root;
 
   Inode* inode = reinterpret_cast<Inode*>(ino);
+  return *inode;
+}
+
+static DirInode& get_dir_inode(fuse_ino_t ino) {
+  if (ino == FUSE_ROOT_ID)
+    return *fs.root;
+
+  DirInode* inode = dynamic_cast<DirInode*>(reinterpret_cast<Inode*>(ino));
   return *inode;
 }
 
@@ -458,7 +525,7 @@ static void sfs_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
 }
 
 static int do_lookup(fuse_ino_t parent, const char *name,
-		     fuse_entry_param *e) {
+		     fuse_entry_param *e, CreateType create = CREATE_NONE) {
   char *fullpath;
   asprintf (&fullpath, "%s/%s", get_inode(parent).toplevelpath ? : ".", name);
   if (fs.debug)
@@ -468,103 +535,17 @@ static int do_lookup(fuse_ino_t parent, const char *name,
   e->attr_timeout = fs.timeout;
   e->entry_timeout = fs.timeout;
 
-  Inode& parent_inode = get_inode (parent);
+  DirInode& parent_inode = get_dir_inode (parent);
   Inode* inode_p = nullptr;
-  if (parent_inode.full) {
-    Inode* ret_inode = parent_inode.lookup(name, e);
-    if (ret_inode) {
-      inode_p = ret_inode;
-      unique_lock<mutex> fs_lock {fs.mutex};
-      e->ino = reinterpret_cast<fuse_ino_t>(inode_p);
-      Inode& inode {*inode_p};
-
-      /* This is just here to make Helgrind happy. It violates the
-	 lock ordering requirement (inode.m must be acquired before
-	 fs.mutex), but this is of no consequence because at this
-	 point no other thread has access to the inode mutex */
-      lock_guard<mutex> g {inode.m};
-      inode.src_ino = e->attr.st_ino;
-      inode.src_dev = e->attr.st_dev;
-      inode.nlookup = 1;
-      inode.full = ret_inode->full;
-      inode.toplevelpath = fullpath;
-      fs_lock.unlock();
-
-      if (fs.debug)
-	cerr << "DEBUG: lookup(): created userspace inode " << e->attr.st_ino
-	     << endl;
-      return 0;
-    }
-
-    return errno;
-  }
- again:
-  auto newfd = get_inode(parent).full->openat(name);
-  if (newfd == -1) {
+  if (!parent_inode.full)
+    abort();
+  Inode* ret_inode = parent_inode.lookup(name, e, create);
+  if (ret_inode) {
+    inode_p = ret_inode;
     unique_lock<mutex> fs_lock {fs.mutex};
-    std::string str(fullpath);
-    int making = fs.making[str];
-    cout << "cannot find file at " << fullpath << ": " << making << endl;
-    sleep (1);
-    if (making == 0) {
-      fs.making[str] = 1;
-      pid_t pid = fork();
-      if (pid) {
-	fs.making[str] = pid;
-      } else {
-	char *cmd;
-	asprintf (&cmd, "cd cold; make -j10 %s", fullpath+2);
-	system(cmd);
-	free (cmd);
-	exit(0);
-      }
-      goto again;
-    } else if (making > 0) {
-      waitpid(making, 0, 0);
-      fs.making[str] = -1;
-      goto again;
-    }
-    return errno;
-  }
+    e->ino = reinterpret_cast<fuse_ino_t>(inode_p);
+    Inode& inode {*inode_p};
 
-  auto res = fstatat(newfd, "", &e->attr, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
-  if (res == -1) {
-    auto saveerr = errno;
-    close(newfd);
-    if (fs.debug)
-      cerr << "DEBUG: lookup(): fstatat failed" << endl;
-    return saveerr;
-  }
-
-  if (e->attr.st_dev != fs.src_dev) {
-    cerr << "WARNING: Mountpoints in the source directory tree will be hidden." << endl;
-    return ENOTSUP;
-  } else if (e->attr.st_ino == FUSE_ROOT_ID) {
-    cerr << "ERROR: Source directory tree must not include inode "
-	 << FUSE_ROOT_ID << endl;
-    return EIO;
-  }
-
-  SrcId id {e->attr.st_ino, e->attr.st_dev};
-  unique_lock<mutex> fs_lock {fs.mutex};
-  try {
-    if (!inode_p)
-      inode_p = &fs.inodes[id];
-  } catch (std::bad_alloc&) {
-    return ENOMEM;
-  }
-  e->ino = reinterpret_cast<fuse_ino_t>(inode_p);
-  Inode& inode {*inode_p};
-
-  if(inode.full != nullptr) { // found existing inode
-    fs_lock.unlock();
-    if (fs.debug)
-      cerr << "DEBUG: lookup(): inode " << e->attr.st_ino
-	   << " (userspace) already known." << endl;
-    lock_guard<mutex> g {inode.m};
-    inode.nlookup++;
-    close(newfd);
-  } else { // no existing inode
     /* This is just here to make Helgrind happy. It violates the
        lock ordering requirement (inode.m must be acquired before
        fs.mutex), but this is of no consequence because at this
@@ -573,16 +554,17 @@ static int do_lookup(fuse_ino_t parent, const char *name,
     inode.src_ino = e->attr.st_ino;
     inode.src_dev = e->attr.st_dev;
     inode.nlookup = 1;
-    inode.full = new FullInode (newfd);
+    inode.full = ret_inode->full;
     inode.toplevelpath = fullpath;
     fs_lock.unlock();
 
     if (fs.debug)
       cerr << "DEBUG: lookup(): created userspace inode " << e->attr.st_ino
 	   << endl;
+    return 0;
   }
 
-  return 0;
+  return errno;
 }
 
 
@@ -915,41 +897,15 @@ static void sfs_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 		       mode_t mode, fuse_file_info *fi) {
   Inode& inode_p = get_inode(parent);
 
-  if (mkdirat(inode_p.get_cold_fd(), name, 0770) < 0) {
-    auto err = errno;
-    if (err == ENFILE || err == EMFILE)
-      cerr << "ERROR: Reached maximum number of file descriptors." << endl;
-    fuse_reply_err(req, err);
-    return;
-  }
-  int dir_fd = openat(inode_p.get_cold_fd(), name, O_DIRECTORY, 0);
-  if (dir_fd < 0) {
-    auto err = errno;
-    if (err == ENFILE || err == EMFILE)
-      cerr << "ERROR: Reached maximum number of file descriptors." << endl;
-    fuse_reply_err(req, err);
-    return;
-  }
-  auto fd = openat(dir_fd, "cold",
-		   (fi->flags | O_CREAT) & ~O_NOFOLLOW, mode);
-  close (dir_fd);
-  if (fd == -1) {
-    auto err = errno;
-    if (err == ENFILE || err == EMFILE)
-      cerr << "ERROR: Reached maximum number of file descriptors." << endl;
-    fuse_reply_err(req, err);
-    return;
+  fuse_entry_param e;
+  auto err = do_lookup(parent, name, &e, CREATE_FILE);
+  if (err) {
+    fuse_reply_err (req, err);
+  } else {
+    fuse_reply_create (req, &e, fi);
   }
 
-  fi->fh = fd;
-  fuse_entry_param e;
-  auto err = do_lookup(parent, name, &e);
-  if (err) {
-    if (err == ENFILE || err == EMFILE)
-      cerr << "ERROR: Reached maximum number of file descriptors." << endl;
-    fuse_reply_err(req, err);
-  } else
-    fuse_reply_create(req, &e, fi);
+  return;
 }
 
 
@@ -1329,8 +1285,6 @@ int main(int argc, char *argv[]) {
   maximize_fd_limit();
 
   // Initialize filesystem root
-  fs.root.full = nullptr;
-  fs.root.nlookup = 9999;
   fs.timeout = options.count("nocache") ? 0 : 86400.0;
 
   struct stat stat;
@@ -1341,7 +1295,8 @@ int main(int argc, char *argv[]) {
     errx(1, "ERROR: source is not a directory");
   fs.src_dev = stat.st_dev;
 
-  fs.root.full = new FullDirInode (open (fs.source.c_str(), O_PATH));
+  fs.root = new RootInode (new FullDirInode (open (fs.source.c_str(), O_PATH)));
+  fs.root->nlookup = 99999;
 
   // Initialize fuse
   fuse_args args = FUSE_ARGS_INIT(0, nullptr);

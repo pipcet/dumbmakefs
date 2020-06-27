@@ -75,7 +75,7 @@ static void forget_one(fuse_ino_t ino, uint64_t n);
 class BuildManager {
 private:
   long build_count = time(nullptr);
-  int pipe[2];
+  int pipe[4];
   std::unordered_map<std::string,bool> finished {};
   std::unordered_map<std::string,std::string> file_to_tree {};
   std::unordered_multimap<std::string,std::string> tree_to_files {};
@@ -104,8 +104,16 @@ public:
   }
 
   BuildManager() {
-    pipe[0] = 0;
-    pipe[1] = 1;
+    if (::pipe(pipe))
+      abort();
+    if (::pipe(pipe+2))
+      abort();
+    if (::fork() == 0) {
+      dup2(pipe[0], 0);
+      dup2(pipe[3], 1);
+      execl("hotfs.pl", "hotfs.pl", NULL);
+      exit(1);
+    }
     finished[""] = true;
   }
 };
@@ -113,6 +121,7 @@ public:
 void BuildManager::send(std::string msg)
 {
   write(pipe[1], msg.c_str(), msg.length() + 1);
+  write(pipe[1], "\n", 2);
 }
 
 void BuildManager::wait(std::string tree)
@@ -120,7 +129,9 @@ void BuildManager::wait(std::string tree)
   std::string str = "";
   while (!finished.count(tree)) {
     char c;
-    read(pipe[0], &c, 1);
+    ssize_t res = read(pipe[2], &c, 1);
+    if (res <= 0)
+      break;
     if (c)
       str += c;
     else {
@@ -283,6 +294,23 @@ public:
   {
     trigger_rdeps();
     return true;
+  }
+
+  virtual std::string child_creator (std::string name)
+  {
+    int fd = ::openat(get_content_fd(), (name + "/creator").c_str(), O_RDONLY);
+    if (fd < 0)
+      return "";
+    FILE *f = fdopen(dup(fd), "r");
+    if (f == NULL)
+      return "";
+    const char *creator_c_str = NULL;
+    fscanf (f, "%ms\n", &creator_c_str);
+    if (creator_c_str == NULL)
+      creator_c_str = "";
+    std::string ret = std::string(creator_c_str);
+    fclose (f);
+    return ret;
   }
 
   std::string creator = "";
@@ -469,7 +497,7 @@ struct DirInode : public Inode {
     return false;
   }
 
-  virtual Inode* file_inode(int fd, std::string name)
+  virtual Inode* file_inode(int, std::string, bool = false)
   {
     while (true);
   }
@@ -491,7 +519,7 @@ struct DirInode : public Inode {
       ::close (::openat (cold->get_content_fd(), path, O_CREAT|O_RDWR, 0660));
       res = fstatat(cold->get_content_fd (), path, &e->attr,
 		    AT_SYMLINK_NOFOLLOW);
-      Inode* ret = file_inode(cold->get_content_fd(), name);
+      Inode* ret = file_inode(cold->get_content_fd(), name, true);
       ret->cold->set_creator (get_tree());
       e->attr.st_mode = ret->mode(e->attr.st_mode);
       return ret;
@@ -618,7 +646,7 @@ struct HotDirInode : public DirInode {
     return false;
   }
 
-  virtual Inode* file_inode(int fd, std::string name)
+  virtual Inode* file_inode(int fd, std::string name, bool = false)
   {
     Inode* ret = new HotInode();
     ret->cold = new ColdInode (fd, name);
@@ -665,11 +693,12 @@ struct WorkDirInode : public DirInode {
 	    cold->visible(name, parent_tree));
   }
 
-  virtual Inode* file_inode(int fd, std::string name)
+  virtual Inode* file_inode(int fd, std::string name, bool is_new = false)
   {
     Inode* ret = new WorkInode(new ColdInode (fd, name), tree, parent_tree);
     ret->cold->make_visible(tree);
-    ret->cold->make_rdep(tree);
+    if (!is_new)
+      ret->cold->make_rdep(tree);
     return ret;
   }
 
@@ -677,7 +706,8 @@ struct WorkDirInode : public DirInode {
   {
     Inode* ret = new WorkDirInode(cold, tree, parent_tree);
     ret->cold->make_visible(tree);
-    ret->cold->make_rdep(tree);
+    if (tree != ret->cold->get_creator())
+      ret->cold->make_rdep(tree);
     return ret;
   }
 
@@ -706,7 +736,7 @@ struct NewDirInode : WorkDirInode {
   NewDirInode(ColdInode *cold, std::string tree, std::string parent_tree)
     : WorkDirInode(cold, tree, parent_tree) {}
 
-  virtual Inode* file_inode(int fd, std::string name)
+  virtual Inode* file_inode(int fd, std::string name, bool = false)
   {
     Inode* ret = new NewInode(new ColdInode (fd, name), tree, parent_tree);
     ret->cold->make_visible(tree);
@@ -720,9 +750,9 @@ struct NewDirInode : WorkDirInode {
     return ret;
   }
 
-  virtual bool visible(std::string name)
+  virtual bool child_visible(std::string name)
   {
-    return cold->get_creator() == tree.c_str();
+    return cold->child_creator(name) == tree;
   }
 };
 
@@ -734,7 +764,7 @@ struct RDepsDirInode : WorkDirInode {
   RDepsDirInode(ColdInode *cold, std::string tree, std::string parent_tree)
     : WorkDirInode(cold, tree, parent_tree) {}
 
-  virtual Inode* file_inode(int fd, std::string name)
+  virtual Inode* file_inode(int fd, std::string name, bool = false)
   {
     Inode* ret = new RDepsInode(new ColdInode (fd, name), tree, parent_tree);
     ret->cold->make_visible(tree);
@@ -746,11 +776,6 @@ struct RDepsDirInode : WorkDirInode {
     Inode* ret = new RDepsDirInode(cold, tree, parent_tree);
     ret->cold->make_visible(tree);
     return ret;
-  }
-
-  virtual bool visible(std::string name)
-  {
-    return cold->rdep(tree);
   }
 
   virtual mode_t mode(mode_t)
@@ -1588,10 +1613,10 @@ static void sfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
 
 
 static void do_write_buf(fuse_req_t req, size_t size, off_t off,
-			 fuse_bufvec *in_buf, fuse_file_info *fi) {
+			 fuse_bufvec *in_buf, int fd) {
   fuse_bufvec out_buf = FUSE_BUFVEC_INIT(size);
   out_buf.buf[0].flags = static_cast<fuse_buf_flags>(FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK);
-  out_buf.buf[0].fd = fi->fh;
+  out_buf.buf[0].fd = fd;
   out_buf.buf[0].pos = off;
 
   auto res = fuse_buf_copy(&out_buf, in_buf, FUSE_BUF_COPY_FLAGS);
@@ -1609,9 +1634,8 @@ static void sfs_write_buf(fuse_req_t req, fuse_ino_t ino, fuse_bufvec *in_buf,
     fuse_reply_err(req, EIO);
     return;
   }
-  (void) ino;
   auto size {fuse_buf_size(in_buf)};
-  do_write_buf(req, size, off, in_buf, fi);
+  do_write_buf(req, size, off, in_buf, inode->cold->get_content_fd());
 }
 
 

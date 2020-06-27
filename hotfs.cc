@@ -135,6 +135,7 @@ public:
   int cold_fd {-1};
   int log_fd {-1};
   int creator_fd {-1};
+  int visible_fd {-1};
 
 public:
   FullInode(int dir_fd) : dir_fd(dir_fd) {
@@ -184,6 +185,26 @@ public:
     return creator_fd;
   }
 
+  int get_visible_fd()
+  {
+    if (visible_fd == -1)
+      {
+	visible_fd = ::openat(dir_fd, "visible", O_DIRECTORY, 0660);
+      }
+
+    if (visible_fd == -1)
+      {
+	visible_fd = ::mkdirat(dir_fd, "visible", 0770);
+      }
+
+    if (visible_fd == -1)
+      {
+	visible_fd = ::openat(dir_fd, "visible", O_DIRECTORY, 0660);
+      }
+
+    return visible_fd;
+  }
+
   void log(const char *msg)
   {
     size_t len = strlen(msg);
@@ -227,6 +248,12 @@ public:
     fclose (f);
   }
 
+  virtual void make_visible(const char *where)
+  {
+    int fd = get_visible_fd ();
+    ::close (::openat (fd, where, O_CREAT|O_RDWR));
+  }
+
   virtual ~FullInode()
   {
     log("file closed\n");
@@ -237,6 +264,8 @@ public:
       close (log_fd);
     if (creator_fd >= 0)
       close (creator_fd);
+    if (visible_fd >= 0)
+      close (visible_fd);
     if (creator)
       free (creator);
   }
@@ -350,7 +379,7 @@ struct DirInode : public Inode {
     }
   }
 
-  virtual bool visible(char *name) {
+  virtual bool visible(const char *name) {
     return true;
   }
 
@@ -370,23 +399,15 @@ struct DirInode : public Inode {
     while ((entry = ::readdir (dir))) {
       if (count++ < offset)
 	continue;
-      size_t entsize;
-      fuse_entry_param e {};
       if (is_dot_or_dotdot (entry->d_name))
 	continue;
       if (entry->d_type != DT_DIR)
 	continue;
-      char *path;
-      asprintf (&path, "%s/cold", entry->d_name);
-      struct stat statbuf;
-      if (fstatat (inode.get_cold_fd(), path, &statbuf, 0) < 0) {
-	free (path);
+      fuse_entry_param e {};
+      Inode *entry_inode = lookup (entry->d_name, &e);
+      if (!entry_inode)
 	continue;
-      }
-      free (path);
-      if (!visible(entry->d_name))
-	continue;
-      e.attr = statbuf;
+      size_t entsize;
       if (plus) {
 	entsize = fuse_add_direntry_plus (req, p, rem, entry->d_name, &e, count);
 	if (entsize > rem) {
@@ -409,12 +430,19 @@ struct DirInode : public Inode {
 
 struct HotInode : public Inode {};
 struct HotDirInode : public DirInode {
+  virtual const char* get_kind()
+  {
+    return "hot";
+  }
+
   HotDirInode(FullInode *full) : DirInode (full) {
   }
 
   virtual Inode* lookup(const char *name, fuse_entry_param *e,
 			CreateType create = CREATE_NONE)
   {
+    if (!visible(name))
+      return nullptr;
     char *path;
     const char *creator = NULL;
     asprintf(&path, "%s/cold", name);
@@ -426,7 +454,7 @@ struct HotDirInode : public DirInode {
       ::close (::openat (full->get_cold_fd(), path, O_CREAT|O_RDWR, 0660));
       res = fstatat(full->get_cold_fd (), path, &e->attr,
 		    AT_SYMLINK_NOFOLLOW);
-      creator = "hot";
+      creator = get_kind();
     }
 
     if (res < 0) {
@@ -436,59 +464,36 @@ struct HotDirInode : public DirInode {
 
     if (S_ISDIR (e->attr.st_mode)) {
       Inode *ret = new HotDirInode(new FullDirInode (full->get_cold_fd(), name));
-      if (creator)
+      if (creator) {
 	ret->full->set_creator (creator);
+	ret->full->make_visible ("hot");
+      }
       free(path);
       return ret;
     } else {
       Inode *ret = new HotInode();
       ret->full = new FullInode (full->get_cold_fd(), name);
-      if (creator)
+      if (creator) {
 	ret->full->set_creator (creator);
+	ret->full->make_visible ("hot");
+      }
       free(path);
       return ret;
     }
   }
 
-  virtual bool visible(char *name) {
+  virtual bool visible(const char *name) {
     {
       char *path;
-      asprintf (&path, "%s/visible", name);
+      asprintf (&path, "%s/visible/%s", name, get_kind());
       int fd = openat (get_cold_fd (), path, O_RDONLY);
-      char *visib = nullptr;
       free (path);
       if (fd >= 0) {
-	FILE *f = fdopen (fd, "r");
-	while (fscanf (f, "%ms", &visib) > 0) {
-	  if (strcmp (visib, "all") == 0) {
-	    free(visib);
-	    fclose (f);
-	    return true;
-	  }
-	  free (visib);
-	}
-	fclose (f);
+	close (fd);
+	return true;
       }
     }
-    {
-      char *path;
-      asprintf (&path, "%s/creator", name);
-      int fd = openat (get_cold_fd (), path, O_RDONLY);
-      if (fd >= 0) {
-	FILE *f = fdopen (fd, "r");
-	char *creator = nullptr;
-	fscanf (f, "%ms", &creator);
-	fclose (f);
-	if (creator == 0)
-	  return false;
-	if (strcmp (creator, "hot")) {
-	  free (creator);
-	  return false;
-	}
-	free (creator);
-      }
-    }
-    return true;
+    return false;
   }
 };
 
@@ -498,39 +503,48 @@ struct MetaInode : public DirInode {
 
 struct BuildInode : public Inode {};
 struct BuildDirInode : public DirInode {
-  uint64_t id;
-  BuildDirInode(FullInode *full, uint64_t id) : DirInode(full), id(id) {
+  const char *id;
+  char *kind;
+
+  virtual const char *get_kind()
+  {
+    if (kind == nullptr)
+      asprintf(&kind, "%s", id);
+    return kind;
+  }
+
+  BuildDirInode(FullInode *full, const char *id) : DirInode(full), id(id) {
     char *creator;
-    asprintf(&creator, "build %ld", id);
+    asprintf(&creator, "%s", id);
     full->set_creator(creator);
     free (creator);
   }
 
   virtual void finish_build() {
     char *creator;
-    asprintf(&creator, "finished build %ld", id);
+    asprintf(&creator, "finished build %s", id);
     full->set_creator(creator);
     free (creator);
   }
 };
 
 struct BuildsInode : public DirInode {
+  std::unordered_map<std::string, BuildDirInode *> cache;
   virtual Inode* lookup (const char *name, fuse_entry_param *e,
 			 CreateType create = CREATE_NONE)
   {
-    long id;
-    if (sscanf (name, "%ld", &id) == strlen (name)) {
+    if (cache.count (std::string(name))) {
+      e->attr.st_ino = 1;
       e->attr.st_mode = (DT_DIR << 12) | 0770;
-      return new BuildDirInode(full, id);
+      return cache[std::string(name)];
     }
-    if (strcmp(name, "hot") == 0) {
-      e->attr.st_mode = (DT_DIR << 12) | 0770;
-      return new HotDirInode(full);
-    }
-    if (strcmp(name, "meta") == 0) {
-      e->attr.st_mode = (DT_DIR << 12) | 0770;
-      return new MetaInode(full);
-    }
+
+    if (create == CREATE_DIR)
+      {
+	e->attr.st_ino = 1;
+	e->attr.st_mode = (DT_DIR << 12) | 0770;
+	return cache[std::string(name)] = new BuildDirInode(full, name);
+      }
 
     return nullptr;
   }
@@ -542,12 +556,34 @@ struct BuildsInode : public DirInode {
     char *p = ret;
     auto rem = size;
 
-    struct dirent *entry;
     Inode& inode = *this;
     DIR *dir = fdopendir (inode.get_cold_fd());
 
     seekdir (dir, 0);
     off_t count = 0;
+
+    for (const auto &n : cache) {
+      if (count++ < offset)
+	continue;
+      fuse_entry_param e {};
+      Inode *entry_inode = lookup(n.first.c_str(), &e);
+      if (!entry_inode)
+	continue;
+      size_t entsize;
+      if (plus) {
+	entsize = fuse_add_direntry_plus (req, p, rem, n.first.c_str(), &e, count);
+	if (entsize > rem) {
+	  abort();
+	}
+      } else {
+	entsize = fuse_add_direntry(req, p, rem, n.first.c_str(), &e.attr, count);
+	if (entsize > rem) {
+	  abort();
+	}
+      }
+      p += entsize;
+      rem -= entsize;
+    }
     size = size - rem;
     fuse_reply_buf(req, ret, size);
     delete[] ret;
@@ -559,20 +595,29 @@ struct BuildsInode : public DirInode {
 };
 
 struct RootInode : public DirInode {
+  std::unordered_map<std::string, Inode *> cache;
   virtual Inode* lookup (const char *name, fuse_entry_param *e,
 			 CreateType create = CREATE_NONE)
   {
+    if (cache.count(std::string(name))) {
+      e->attr.st_ino = 1;
+      e->attr.st_mode = (DT_DIR << 12) | 0770;
+      return cache[std::string(name)];
+    }
     if (strcmp(name, "hot") == 0) {
+      e->attr.st_ino = 1;
       e->attr.st_mode = (DT_DIR << 12) | 0770;
       return new HotDirInode(full);
     }
     if (strcmp(name, "meta") == 0) {
+      e->attr.st_ino = 1;
       e->attr.st_mode = (DT_DIR << 12) | 0770;
       return new MetaInode(full);
     }
-    if (strcmp(name, "builds") == 0) {
+    if (strcmp(name, "build") == 0) {
+      e->attr.st_ino = 1;
       e->attr.st_mode = (DT_DIR << 12) | 0770;
-      return new BuildsInode(full);
+      return cache[std::string("build")] = new BuildsInode(full);
     }
 
     return nullptr;
@@ -585,12 +630,39 @@ struct RootInode : public DirInode {
     char *p = ret;
     auto rem = size;
 
-    struct dirent *entry;
     Inode& inode = *this;
+
+    const char *entries[] = {
+      "hot", "meta", "build",
+    };
+
+    off_t count = 0;
+    for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++) {
+      if (count++ < offset)
+	continue;
+      fuse_entry_param e {};
+      Inode *entry_inode = lookup(entries[i], &e);
+      if (!entry_inode)
+	continue;
+      size_t entsize;
+      if (plus) {
+	entsize = fuse_add_direntry_plus (req, p, rem, entries[i], &e, count);
+	if (entsize > rem) {
+	  abort();
+	}
+      } else {
+	entsize = fuse_add_direntry(req, p, rem, entries[i], &e.attr, count);
+	if (entsize > rem) {
+	  abort();
+	}
+      }
+      p += entsize;
+      rem -= entsize;
+    }
+
     DIR *dir = fdopendir (inode.get_cold_fd());
 
     seekdir (dir, 0);
-    off_t count = 0;
     size = size - rem;
     fuse_reply_buf(req, ret, size);
     delete[] ret;
@@ -781,7 +853,7 @@ static int do_lookup(fuse_ino_t parent, const char *name,
     lock_guard<mutex> g {inode.m};
     inode.src_ino = e->attr.st_ino;
     inode.src_dev = e->attr.st_dev;
-    inode.nlookup = 1;
+    inode.nlookup++;
     inode.full = ret_inode->full;
     inode.toplevelpath = fullpath;
     fs_lock.unlock();
@@ -820,12 +892,14 @@ static void mknod_symlink(fuse_req_t req, fuse_ino_t parent,
 			  const char *name, mode_t mode, dev_t rdev,
 			  const char *link) {
   int res;
-  Inode& inode_p = get_inode(parent);
+  DirInode& inode_p = get_dir_inode(parent);
   auto saverr = ENOMEM;
-
-  if (S_ISDIR(mode))
-    res = mkdirat(inode_p.get_cold_fd(), name, mode);
-  else if (S_ISLNK(mode))
+  fuse_entry_param e {};
+  if (S_ISDIR(mode)) {
+    e.ino = reinterpret_cast<fuse_ino_t>(inode_p.lookup(name, &e, CREATE_DIR));
+    fuse_reply_entry (req, &e);
+    return;
+  } else if (S_ISLNK(mode))
     res = symlinkat(link, inode_p.get_cold_fd(), name);
   else
     res = mknodat(inode_p.get_cold_fd(), name, mode, rdev);
@@ -833,7 +907,6 @@ static void mknod_symlink(fuse_req_t req, fuse_ino_t parent,
   if (res == -1)
     goto out;
 
-  fuse_entry_param e;
   saverr = do_lookup(parent, name, &e);
   if (saverr)
     goto out;
@@ -938,7 +1011,7 @@ static void forget_one(fuse_ino_t ino, uint64_t n) {
 	 << inode.src_ino << endl;
     abort();
   }
-  inode.nlookup -= n;
+  //inode.nlookup -= n;
   if (!inode.nlookup) {
     if (fs.debug)
       cerr << "DEBUG: forget: cleaning up inode " << inode.src_ino << endl;

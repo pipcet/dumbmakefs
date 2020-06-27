@@ -74,13 +74,39 @@ static void forget_one(fuse_ino_t ino, uint64_t n);
 
 class BuildManager {
 private:
+  long build_count = time(nullptr);
   int pipe[2];
+  std::unordered_map<std::string,bool> finished {};
+  std::unordered_map<std::string,std::string> file_to_tree {};
+  std::unordered_multimap<std::string,std::string> tree_to_files {};
 public:
   void send(std::string msg);
+  void wait(std::string tree);
+  std::string build(std::string file) {
+    if (file_to_tree.count(file) &&
+	finished.count(file_to_tree[file]))
+      return "";
+    char *str;
+    asprintf(&str, "%ld", build_count++);
+    std::string tree(str);
+    send("start " + tree + " " + file);
+    file_to_tree[file] = tree;
+    tree_to_files.insert({tree,file});
+    return tree;
+  }
+  void cancel(std::string tree) {
+    send("cancel " + tree);
+    auto range = tree_to_files.equal_range(tree);
+    for_each(range.first, range.second, [this](auto &x) {
+      file_to_tree.erase(x.second);
+    });
+    tree_to_files.erase(tree);
+  }
 
   BuildManager() {
     pipe[0] = 0;
     pipe[1] = 1;
+    finished[""] = true;
   }
 };
 
@@ -89,20 +115,31 @@ void BuildManager::send(std::string msg)
   write(pipe[1], msg.c_str(), msg.length() + 1);
 }
 
+void BuildManager::wait(std::string tree)
+{
+  std::string str = "";
+  while (!finished.count(tree)) {
+    char c;
+    read(pipe[0], &c, 1);
+    if (c)
+      str += c;
+    else {
+      finished[str] = true;
+      str = "";
+    }
+  }
+}
+
 static BuildManager bm;
-static long build_count = 1;
 
 static void cancel_build(std::string tree)
 {
-  bm.send("cancel " + tree);
+  bm.cancel(tree);
 }
 
-static void create_build(std::string file)
+static void build_file(std::string file)
 {
-  char *str;
-  asprintf(&str, "%ld", build_count++);
-  std::string tree(str);
-  bm.send("start " + tree + " " + file);
+  bm.wait(bm.build(file));
 }
 
 struct ColdInode {
@@ -553,6 +590,20 @@ struct DirInode : public Inode {
 
 struct HotInode : public Inode {};
 struct HotDirInode : public DirInode {
+  virtual Inode* lookup(std::string name, fuse_entry_param *e,
+			CreateType create = CREATE_NONE)
+  {
+    Inode* ret = DirInode::lookup(name, e, CREATE_NONE);
+    if (ret == nullptr) {
+      build_file (name);
+    }
+    ret = DirInode::lookup(name, e, CREATE_NONE);
+    if (ret == nullptr && create != CREATE_NONE) {
+      ret = DirInode::lookup(name, e, create);
+    }
+    return ret;
+  }
+  
   virtual const std::string get_tree()
   {
     return "hot";

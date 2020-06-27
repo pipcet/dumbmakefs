@@ -72,43 +72,37 @@ struct Inode;
 static Inode& get_inode(fuse_ino_t ino);
 static void forget_one(fuse_ino_t ino, uint64_t n);
 
-class BuildProcess {
+class BuildManager {
+private:
+  int pipe[2];
 public:
-  pid_t pid;
+  void send(std::string msg);
+
+  BuildManager() {
+    pipe[0] = 0;
+    pipe[1] = 1;
+  }
 };
 
-static std::unordered_map<std::string,BuildProcess> build_map;
-
-struct NewDirInode;
-static NewDirInode *build_newdir(std::string tree);
-
-static void cleanup_build(std::string tree)
+void BuildManager::send(std::string msg)
 {
-  NewDirInode *newdir = build_newdir(tree);
-  
+  write(pipe[1], msg.c_str(), msg.length() + 1);
 }
+
+static BuildManager bm;
+static long build_count = 1;
 
 static void cancel_build(std::string tree)
 {
-  if (build_map.count(tree)) {
-    ::kill(build_map[tree].pid, SIGTERM);
-    ::waitpid(build_map[tree].pid, NULL, 0);
-    cleanup_build(tree);
-  }
+  bm.send("cancel " + tree);
 }
 
-static long build_count = 1;
-
-static BuildProcess& new_build()
+static void create_build(std::string file)
 {
   char *str;
-  std::string tree;
-  do {
-    asprintf(&str, "%ld", build_count++);
-    tree = std::string(str);
-  } while (build_map.count(tree));
-
-  return build_map[tree] = BuildProcess();
+  asprintf(&str, "%ld", build_count++);
+  std::string tree(str);
+  bm.send("start " + tree + " " + file);
 }
 
 struct ColdInode {

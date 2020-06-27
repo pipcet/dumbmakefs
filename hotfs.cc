@@ -516,7 +516,23 @@ struct MetaInode : public DirInode {
   MetaInode(ColdInode *cold) : DirInode(cold) {}
 };
 
-struct WorkInode : public Inode {};
+struct WorkInode : public Inode {
+  const char *tree;
+  const char *parent_tree;
+
+  virtual bool modify()
+  {
+    if (strcmp (cold->get_creator (), tree) == 0)
+      return Inode::modify();
+    return false;
+  }
+
+  WorkInode(ColdInode *cold, const char *tree, const char *parent_tree)
+    : Inode(), tree(tree), parent_tree(parent_tree)
+  {
+    this->cold = cold;
+  }
+};
 struct WorkDirInode : public DirInode {
   const char *tree;
   const char *parent_tree;
@@ -529,8 +545,7 @@ struct WorkDirInode : public DirInode {
 
   virtual Inode* file_inode(int fd, const char *name)
   {
-    Inode* ret = new WorkInode();
-    ret->cold = new ColdInode (fd, name);
+    Inode* ret = new WorkInode(new ColdInode (fd, name), tree, parent_tree);
     ret->cold->set_creator(tree);
     ret->cold->make_visible(tree);
     ret->cold->make_rdep(tree);
@@ -565,14 +580,15 @@ struct WorkDirInode : public DirInode {
 };
 
 struct NewInode : WorkInode {
+  NewInode(ColdInode *cold, const char *tree, const char *parent_tree)
+    : WorkInode(cold, tree, parent_tree) {}
 };
 struct NewDirInode : WorkDirInode {
   NewDirInode(ColdInode *cold, const char *id) : WorkDirInode(cold, id, nullptr) {}
 
   virtual Inode* file_inode(int fd, const char *name)
   {
-    Inode* ret = new NewInode();
-    ret->cold = new ColdInode (fd, name);
+    Inode* ret = new NewInode(new ColdInode (fd, name), tree, parent_tree);
     ret->cold->set_creator(tree);
     ret->cold->make_visible(tree);
     return ret;
@@ -592,14 +608,16 @@ struct NewDirInode : WorkDirInode {
   }
 };
 
-struct RDepsInode : WorkInode {};
+struct RDepsInode : WorkInode {
+  RDepsInode(ColdInode *cold, const char *tree, const char *parent_tree)
+    : WorkInode(cold, tree, parent_tree) {}
+};
 struct RDepsDirInode : WorkDirInode {
   RDepsDirInode(ColdInode *cold, const char *id) : WorkDirInode(cold, id, nullptr) {}
 
   virtual Inode* file_inode(int fd, const char *name)
   {
-    Inode* ret = new RDepsInode();
-    ret->cold = new ColdInode (fd, name);
+    Inode* ret = new RDepsInode(new ColdInode (fd, name), tree, parent_tree);
     ret->cold->set_creator(tree);
     ret->cold->make_visible(tree);
     return ret;

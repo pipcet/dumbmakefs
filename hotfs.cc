@@ -62,10 +62,54 @@ static_assert(sizeof(fuse_ino_t) >= sizeof(uint64_t),
 	      "fuse_ino_t must be at least 64 bits");
 
 
+static bool is_dot_or_dotdot(std::string name) {
+  return name[0] == '.' &&
+    (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'));
+}
+
 /* Forward declarations */
 struct Inode;
 static Inode& get_inode(fuse_ino_t ino);
 static void forget_one(fuse_ino_t ino, uint64_t n);
+
+class BuildProcess {
+public:
+  pid_t pid;
+};
+
+static std::unordered_map<std::string,BuildProcess> build_map;
+
+struct NewDirInode;
+static NewDirInode *build_newdir(std::string tree);
+
+static void cleanup_build(std::string tree)
+{
+  NewDirInode *newdir = build_newdir(tree);
+  
+}
+
+static void cancel_build(std::string tree)
+{
+  if (build_map.count(tree)) {
+    ::kill(build_map[tree].pid, SIGTERM);
+    ::waitpid(build_map[tree].pid, NULL, 0);
+    cleanup_build(tree);
+  }
+}
+
+static long build_count = 1;
+
+static BuildProcess& new_build()
+{
+  char *str;
+  std::string tree;
+  do {
+    asprintf(&str, "%ld", build_count++);
+    tree = std::string(str);
+  } while (build_map.count(tree));
+
+  return build_map[tree] = BuildProcess();
+}
 
 struct ColdInode {
 public:
@@ -187,8 +231,26 @@ public:
     return ret;
   }
 
+  void trigger_rdep(std::string tree) {
+    cancel_build(tree);
+  }
+
+  void trigger_rdeps()
+  {
+    int dirfd;
+    DIR *dir = fdopendir(dirfd = dup(get_rdeps_fd()));
+    struct dirent *dirent;
+    while ((dirent = readdir (dir))) {
+      if (is_dot_or_dotdot (dirent->d_name))
+	continue;
+      trigger_rdep(std::string(dirent->d_name));
+    }
+    closedir(dir);
+  }
+
   bool modify()
   {
+    trigger_rdeps();
     return true;
   }
 
@@ -362,11 +424,6 @@ struct ErrorInode : public Inode {
 static std::unordered_map<int, Inode *>error_cache;
 
 enum CreateType { CREATE_NONE, CREATE_DIR, CREATE_FILE };
-
-static bool is_dot_or_dotdot(std::string name) {
-  return name[0] == '.' &&
-    (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'));
-}
 
 struct DirInode : public Inode {
   DirInode(ColdInode *cold) {
@@ -542,7 +599,7 @@ struct WorkInode : public Inode {
 
   virtual bool modify()
   {
-    if (strcmp (cold->get_creator ().c_str(), tree.c_str()) == 0)
+    if (cold->get_creator () == tree)
       return Inode::modify();
     return false;
   }
@@ -1836,4 +1893,8 @@ int main(int argc, char *argv[]) {
   fuse_opt_free_args(&args);
 
   return ret ? 1 : 0;
+}
+static NewDirInode *build_newdir(std::string tree)
+{
+  return new NewDirInode(fs.root->cold, tree, "hot");
 }

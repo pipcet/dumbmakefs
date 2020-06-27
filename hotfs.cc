@@ -82,6 +82,9 @@
 #include <thread>
 #include <iomanip>
 
+#undef abort
+#define abort() while (true)
+
 using namespace std;
 
 /* We are re-using pointers to our `struct sfs_inode` and `struct

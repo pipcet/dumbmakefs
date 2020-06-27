@@ -399,21 +399,141 @@ struct DirInode : public Inode {
 };
 
 struct HotInode : public Inode {};
-struct HotDirInode : public DirInode {};
+struct HotDirInode : public DirInode {
+  HotDirInode(FullInode *full) : DirInode (full) {
+  }
 
-struct BuildInode : public Inode {};
-struct BuildDirInode : public DirInode {};
+  virtual Inode* lookup(const char *name, fuse_entry_param *e,
+			CreateType create = CREATE_NONE)
+  {
+    char *path;
+    const char *creator = NULL;
+    asprintf(&path, "%s/cold", name);
+    auto res = fstatat(full->get_cold_fd (), path, &e->attr,
+		       AT_SYMLINK_NOFOLLOW);
+
+    if (create == CREATE_FILE && res < 0) {
+      ::mkdirat (full->get_cold_fd (), name, 0770);
+      ::close (::openat (full->get_cold_fd(), path, O_CREAT|O_RDWR, 0660));
+      res = fstatat(full->get_cold_fd (), path, &e->attr,
+		    AT_SYMLINK_NOFOLLOW);
+      creator = "hot";
+    }
+
+    if (res < 0) {
+      free(path);
+      return nullptr;
+    }
+
+    if (S_ISDIR (e->attr.st_mode)) {
+      Inode *ret = new HotDirInode(new FullDirInode (full->get_cold_fd(), name));
+      if (creator)
+	ret->full->set_creator (creator);
+      free(path);
+      return ret;
+    } else {
+      Inode *ret = new HotInode();
+      ret->full = new FullInode (full->get_cold_fd(), name);
+      if (creator)
+	ret->full->set_creator (creator);
+      free(path);
+      return ret;
+    }
+  }
+
+  virtual void readdir(fuse_req_t req, size_t size,
+		       off_t offset, fuse_file_info *fi, int plus) {
+    char *ret = new (nothrow) char[size];
+    memset (ret, 0, size);
+    char *p = ret;
+    auto rem = size;
+
+    struct dirent *entry;
+    Inode& inode = *this;
+    DIR *dir = fdopendir (inode.get_cold_fd());
+
+    seekdir (dir, 0);
+    off_t count = 0;
+    while ((entry = ::readdir (dir))) {
+      if (count++ < offset)
+	continue;
+      size_t entsize;
+      fuse_entry_param e {};
+      if (is_dot_or_dotdot (entry->d_name))
+	continue;
+      if (entry->d_type != DT_DIR)
+	continue;
+      char *path;
+      asprintf (&path, "%s/cold", entry->d_name);
+      struct stat statbuf;
+      if (fstatat (inode.get_cold_fd(), path, &statbuf, 0) < 0) {
+	free (path);
+	continue;
+      }
+      free (path);
+      asprintf (&path, "%s/creator", entry->d_name);
+      int fd = openat (inode.get_cold_fd(), path, O_RDONLY);
+      char *creator = nullptr;
+      if (fd < 0) {
+	free (path);
+	continue;
+      }
+      free (path);
+      FILE *f = fdopen (fd, "r");
+      fscanf (f, "%ms", &creator);
+      fclose (f);
+      if (creator == 0)
+	continue;
+      if (strcmp (creator, "hot"))
+	continue;
+      e.attr = statbuf;
+      if (plus) {
+	entsize = fuse_add_direntry_plus (req, p, rem, entry->d_name, &e, count);
+	if (entsize > rem) {
+	  abort();
+	}
+      } else {
+	entsize = fuse_add_direntry(req, p, rem, entry->d_name, &e.attr, count);
+	if (entsize > rem) {
+	  abort();
+	}
+      }
+      p += entsize;
+      rem -= entsize;
+    }
+    size = size - rem;
+    fuse_reply_buf(req, ret, size);
+    delete[] ret;
+  }
+};
 
 struct MetaInode : public DirInode {
   MetaInode(FullInode *full) : DirInode(full) {}
 };
-struct RootInode : public DirInode {
+
+struct BuildInode : public Inode {};
+struct BuildDirInode : public DirInode {
+  uint64_t id;
+  BuildDirInode(FullInode *full, uint64_t id) : DirInode(full), id(id) {
+    char *creator;
+    asprintf(&creator, "build %ld", id);
+    full->set_creator(creator);
+    free (creator);
+  }
+};
+
+struct BuildsInode : public DirInode {
   virtual Inode* lookup (const char *name, fuse_entry_param *e,
 			 CreateType create = CREATE_NONE)
   {
+    long id;
+    if (sscanf (name, "%ld", &id) == strlen (name)) {
+      e->attr.st_mode = (DT_DIR << 12) | 0770;
+      return new BuildDirInode(full, id);
+    }
     if (strcmp(name, "hot") == 0) {
       e->attr.st_mode = (DT_DIR << 12) | 0770;
-      return new DirInode(full);
+      return new HotDirInode(full);
     }
     if (strcmp(name, "meta") == 0) {
       e->attr.st_mode = (DT_DIR << 12) | 0770;
@@ -422,6 +542,49 @@ struct RootInode : public DirInode {
 
     return nullptr;
   }
+
+  virtual void readdir(fuse_req_t req, size_t size,
+		       off_t offset, fuse_file_info *fi, int plus) {
+    char *ret = new (nothrow) char[size];
+    memset (ret, 0, size);
+    char *p = ret;
+    auto rem = size;
+
+    struct dirent *entry;
+    Inode& inode = *this;
+    DIR *dir = fdopendir (inode.get_cold_fd());
+
+    seekdir (dir, 0);
+    off_t count = 0;
+    size = size - rem;
+    fuse_reply_buf(req, ret, size);
+    delete[] ret;
+  }
+  BuildsInode(FullInode *full) : DirInode(full) {
+    full->set_creator("builds");
+  }
+};
+
+struct RootInode : public DirInode {
+  virtual Inode* lookup (const char *name, fuse_entry_param *e,
+			 CreateType create = CREATE_NONE)
+  {
+    if (strcmp(name, "hot") == 0) {
+      e->attr.st_mode = (DT_DIR << 12) | 0770;
+      return new HotDirInode(full);
+    }
+    if (strcmp(name, "meta") == 0) {
+      e->attr.st_mode = (DT_DIR << 12) | 0770;
+      return new MetaInode(full);
+    }
+    if (strcmp(name, "builds") == 0) {
+      e->attr.st_mode = (DT_DIR << 12) | 0770;
+      return new BuildsInode(full);
+    }
+
+    return nullptr;
+  }
+
   virtual void readdir(fuse_req_t req, size_t size,
 		       off_t offset, fuse_file_info *fi, int plus) {
     char *ret = new (nothrow) char[size];
@@ -1305,7 +1468,7 @@ int main(int argc, char *argv[]) {
   maximize_fd_limit();
 
   // Initialize filesystem root
-  fs.timeout = options.count("nocache") ? 0 : 86400.0;
+  fs.timeout = options.count("nocache") ? 0 : 0;
 
   struct stat stat;
   auto ret = lstat(fs.source.c_str(), &stat);

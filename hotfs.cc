@@ -88,7 +88,8 @@ public:
     get_log_fd();
     this->get_content_fd();
   }
-  ColdInode (int fd, const char *path) : ColdInode (::openat(fd, path, 0, 0770)) {}
+  ColdInode (int fd, std::string path)
+    : ColdInode (::openat(fd, path.c_str(), 0, 0770)) {}
 
   virtual int get_content_fd()
   {
@@ -119,12 +120,15 @@ public:
     return log_fd;
   }
 
-  int get_creator_fd()
+  int get_creator_fd(bool del = false)
   {
-    if (creator_fd == -1)
-      {
-	creator_fd = ::openat(dir_fd, "creator", O_RDWR|O_CREAT, 0660);
-      }
+    if (del) {
+      ::unlinkat (dir_fd, "creator", 0);
+      creator_fd = -1;
+    }
+    if (creator_fd == -1) {
+      creator_fd = ::openat(dir_fd, "creator", O_RDWR|O_CREAT, 0660);
+    }
 
     return creator_fd;
   }
@@ -188,49 +192,51 @@ public:
     return true;
   }
 
-  char *creator {0};
-  virtual const char *get_creator ()
+  std::string creator = "";
+  virtual std::string get_creator ()
   {
-    if (creator == NULL)
-      {
-	int fd = get_creator_fd ();
-	if (fd < 0)
-	  abort();
-	FILE *f = fdopen(dup(fd), "r");
-	if (f == NULL)
-	  abort();
-	fscanf (f, "%ms\n", &creator);
-	if (creator == NULL)
-	  abort();
-	fclose (f);
-      }
+    if (creator.empty()) {
+      int fd = get_creator_fd ();
+      if (fd < 0)
+	abort();
+      FILE *f = fdopen(dup(fd), "r");
+      if (f == NULL)
+	abort();
+      const char *creator_c_str = NULL;
+      fscanf (f, "%ms\n", &creator_c_str);
+      if (creator_c_str == NULL)
+	creator_c_str = "";
+      creator = std::string(creator_c_str);
+      fclose (f);
+    }
     return creator;
   }
 
-  virtual void set_creator(const char *str)
+  virtual void set_creator(std::string tree)
   {
-    int fd = get_creator_fd ();
+    int fd = get_creator_fd (true);
     FILE *f = fdopen(dup(fd), "w+");
-    fprintf (f, "%s\n", str);
+    fprintf (f, "%s\n", tree.c_str());
     fclose (f);
+    lseek(fd, 0, SEEK_SET);
   }
 
-  virtual void make_visible(const char *where)
+  virtual void make_visible(std::string tree)
   {
     int fd = get_visible_fd ();
-    ::close (::openat (fd, where, O_CREAT|O_RDWR, 0660));
+    ::close (::openat (fd, tree.c_str(), O_CREAT|O_RDWR, 0660));
   }
 
-  virtual void make_rdep(const char *tree)
+  virtual void make_rdep(std::string tree)
   {
     int fd = get_rdeps_fd ();
-    ::close (::openat (fd, tree, O_CREAT|O_RDWR, 0660));
+    ::close (::openat (fd, tree.c_str(), O_CREAT|O_RDWR, 0660));
   }
 
-  virtual bool visible(const char *name, const char *where)
+  virtual bool visible(std::string name, std::string tree)
   {
     char *path;
-    asprintf (&path, "%s/visible/%s", name, where);
+    asprintf (&path, "%s/visible/%s", name.c_str(), tree.c_str());
     int fd = ::openat (get_content_fd(), path, O_RDONLY);
     free (path);
     if (fd >= 0) {
@@ -240,10 +246,10 @@ public:
     return false;
   }
 
-  virtual bool rdep(const char *where)
+  virtual bool rdep(std::string tree)
   {
     char *path;
-    asprintf (&path, "rdeps/%s", where);
+    asprintf (&path, "rdeps/%s", tree.c_str());
     int fd = ::openat (dir_fd, path, O_RDONLY);
     free (path);
     if (fd >= 0) {
@@ -265,8 +271,6 @@ public:
       close (creator_fd);
     if (visible_fd >= 0)
       close (visible_fd);
-    if (creator)
-      free (creator);
   }
 };
 
@@ -288,7 +292,8 @@ struct ColdDirInode : public ColdInode {
   }
 
   ColdDirInode (int fd) : ColdInode (fd) {}
-  ColdDirInode (int fd, const char *path) : ColdInode (::openat(fd, path, 0, 0770)) {}
+  ColdDirInode (int fd, std::string path)
+    : ColdInode (::openat(fd, path.c_str(), 0, 0770)) {}
 };
 
 struct Inode {
@@ -358,7 +363,7 @@ static std::unordered_map<int, Inode *>error_cache;
 
 enum CreateType { CREATE_NONE, CREATE_DIR, CREATE_FILE };
 
-static bool is_dot_or_dotdot(const char *name) {
+static bool is_dot_or_dotdot(std::string name) {
   return name[0] == '.' &&
     (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'));
 }
@@ -368,7 +373,7 @@ struct DirInode : public Inode {
     this->cold = cold;
   }
 
-  virtual bool child_visible(const char *name)
+  virtual bool child_visible(std::string name)
   {
     if (cold->visible(name, get_tree()))
       return true;
@@ -376,13 +381,16 @@ struct DirInode : public Inode {
     return false;
   }
 
-  virtual Inode* file_inode(int fd, const char *name) { while (true); }
+  virtual Inode* file_inode(int fd, std::string name)
+  {
+    while (true);
+  }
   virtual Inode* dir_inode(ColdDirInode *) { while (true); }
-  virtual Inode* lookup(const char *name, fuse_entry_param *e,
+  virtual Inode* lookup(std::string name, fuse_entry_param *e,
 			CreateType create = CREATE_NONE)
   {
     char *path;
-    asprintf(&path, "%s/content", name);
+    asprintf(&path, "%s/content", name.c_str());
     auto res = fstatat(cold->get_content_fd (), path, &e->attr,
 		       AT_SYMLINK_NOFOLLOW);
 
@@ -391,11 +399,12 @@ struct DirInode : public Inode {
 	errno = EIO;
 	return nullptr;
       }
-      ::mkdirat (cold->get_content_fd (), name, 0770);
+      ::mkdirat (cold->get_content_fd (), name.c_str(), 0770);
       ::close (::openat (cold->get_content_fd(), path, O_CREAT|O_RDWR, 0660));
       res = fstatat(cold->get_content_fd (), path, &e->attr,
 		    AT_SYMLINK_NOFOLLOW);
       Inode* ret = file_inode(cold->get_content_fd(), name);
+      ret->cold->set_creator (get_tree());
       e->attr.st_mode = ret->mode(e->attr.st_mode);
       return ret;
     } else if (create == CREATE_DIR && res < 0) {
@@ -403,11 +412,11 @@ struct DirInode : public Inode {
 	errno = EIO;
 	return nullptr;
       }
-      ::mkdirat (cold->get_content_fd (), name, 0770);
+      ::mkdirat (cold->get_content_fd (), name.c_str(), 0770);
       ::mkdirat (cold->get_content_fd (), path, 0770);
       res = fstatat(cold->get_content_fd (), path, &e->attr,
 		    AT_SYMLINK_NOFOLLOW);
-      Inode* ret = dir_inode(new ColdDirInode(cold->get_content_fd(), name));
+      Inode* ret = dir_inode(new ColdDirInode(cold->get_content_fd(), name.c_str()));
       e->attr.st_mode = ret->mode(e->attr.st_mode);
       return ret;
     }
@@ -432,12 +441,12 @@ struct DirInode : public Inode {
     }
   }
 
-  virtual const char* get_tree()
+  virtual const std::string get_tree()
   {
     return nullptr;
   }
 
-  virtual bool child_clash(const char *name) {
+  virtual bool child_clash(std::string name) {
     fuse_entry_param e {};
     Inode *inode = lookup (name, &e);
     if (!inode)
@@ -493,7 +502,7 @@ struct DirInode : public Inode {
 
 struct HotInode : public Inode {};
 struct HotDirInode : public DirInode {
-  virtual const char* get_tree()
+  virtual const std::string get_tree()
   {
     return "hot";
   }
@@ -502,16 +511,15 @@ struct HotDirInode : public DirInode {
 
   virtual bool modify()
   {
-    if (strcmp (cold->get_creator (), get_tree()) == 0)
+    if (cold->get_creator () == get_tree())
       return Inode::modify();
     return false;
   }
 
-  virtual Inode* file_inode(int fd, const char *name)
+  virtual Inode* file_inode(int fd, std::string name)
   {
     Inode* ret = new HotInode();
     ret->cold = new ColdInode (fd, name);
-    ret->cold->set_creator("hot");
     ret->cold->make_visible("hot");
     return ret;
   }
@@ -519,7 +527,6 @@ struct HotDirInode : public DirInode {
   virtual Inode* dir_inode(ColdDirInode *cold)
   {
     Inode* ret = new HotDirInode(cold);
-    ret->cold->set_creator("hot");
     ret->cold->make_visible("hot");
     return ret;
   }
@@ -530,36 +537,35 @@ struct MetaInode : public DirInode {
 };
 
 struct WorkInode : public Inode {
-  const char *tree;
-  const char *parent_tree;
+  std::string tree;
+  std::string parent_tree;
 
   virtual bool modify()
   {
-    if (strcmp (cold->get_creator (), tree) == 0)
+    if (strcmp (cold->get_creator ().c_str(), tree.c_str()) == 0)
       return Inode::modify();
     return false;
   }
 
-  WorkInode(ColdInode *cold, const char *tree, const char *parent_tree)
+  WorkInode(ColdInode *cold, std::string tree, std::string parent_tree)
     : Inode(), tree(tree), parent_tree(parent_tree)
   {
     this->cold = cold;
   }
 };
 struct WorkDirInode : public DirInode {
-  const char *tree;
-  const char *parent_tree;
+  std::string tree;
+  std::string parent_tree;
 
-  virtual bool child_visible(const char *name)
+  virtual bool child_visible(std::string name)
   {
     return (DirInode::child_visible(name) ||
 	    cold->visible(name, parent_tree));
   }
 
-  virtual Inode* file_inode(int fd, const char *name)
+  virtual Inode* file_inode(int fd, std::string name)
   {
     Inode* ret = new WorkInode(new ColdInode (fd, name), tree, parent_tree);
-    ret->cold->set_creator(tree);
     ret->cold->make_visible(tree);
     ret->cold->make_rdep(tree);
     return ret;
@@ -568,82 +574,79 @@ struct WorkDirInode : public DirInode {
   virtual Inode* dir_inode(ColdDirInode *cold)
   {
     Inode* ret = new WorkDirInode(cold, tree, parent_tree);
-    ret->cold->set_creator(tree);
     ret->cold->make_visible(tree);
     ret->cold->make_rdep(tree);
     return ret;
   }
 
-  virtual const char *get_tree()
+  virtual const std::string get_tree()
   {
     return tree;
   }
 
-  WorkDirInode(ColdInode *cold, const char *tree, const char *parent_tree)
+  WorkDirInode(ColdInode *cold, std::string tree, std::string parent_tree)
     : DirInode(cold), tree(tree), parent_tree(parent_tree) {
   }
 
   virtual void finish_build() {
     char *creator;
-    asprintf(&creator, "finished build %s", tree);
+    asprintf(&creator, "finished build %s", tree.c_str());
     cold->set_creator(creator);
     free (creator);
   }
 };
 
 struct NewInode : WorkInode {
-  NewInode(ColdInode *cold, const char *tree, const char *parent_tree)
+  NewInode(ColdInode *cold, std::string tree, std::string parent_tree)
     : WorkInode(cold, tree, parent_tree) {}
 };
 struct NewDirInode : WorkDirInode {
-  NewDirInode(ColdInode *cold, const char *id) : WorkDirInode(cold, id, nullptr) {}
+  NewDirInode(ColdInode *cold, std::string tree, std::string parent_tree)
+    : WorkDirInode(cold, tree, parent_tree) {}
 
-  virtual Inode* file_inode(int fd, const char *name)
+  virtual Inode* file_inode(int fd, std::string name)
   {
     Inode* ret = new NewInode(new ColdInode (fd, name), tree, parent_tree);
-    ret->cold->set_creator(tree);
     ret->cold->make_visible(tree);
     return ret;
   }
 
   virtual Inode* dir_inode(ColdDirInode *cold)
   {
-    Inode* ret = new NewDirInode(cold, tree);
-    ret->cold->set_creator(tree);
+    Inode* ret = new NewDirInode(cold, tree, parent_tree);
     ret->cold->make_visible(tree);
     return ret;
   }
 
-  virtual bool visible(const char *name)
+  virtual bool visible(std::string name)
   {
-    return strcmp (cold->get_creator(), tree) == 0;
+    return cold->get_creator() == tree.c_str();
   }
 };
 
 struct RDepsInode : WorkInode {
-  RDepsInode(ColdInode *cold, const char *tree, const char *parent_tree)
+  RDepsInode(ColdInode *cold, std::string tree, std::string parent_tree)
     : WorkInode(cold, tree, parent_tree) {}
 };
 struct RDepsDirInode : WorkDirInode {
-  RDepsDirInode(ColdInode *cold, const char *id) : WorkDirInode(cold, id, nullptr) {}
+  RDepsDirInode(ColdInode *cold, std::string tree, std::string parent_tree)
+    : WorkDirInode(cold, tree, parent_tree) {}
 
-  virtual Inode* file_inode(int fd, const char *name)
+  virtual Inode* file_inode(int fd, std::string name)
   {
     Inode* ret = new RDepsInode(new ColdInode (fd, name), tree, parent_tree);
-    ret->cold->set_creator(tree);
     ret->cold->make_visible(tree);
     return ret;
   }
 
   virtual Inode* dir_inode(ColdDirInode *cold)
   {
-    Inode* ret = new RDepsDirInode(cold, tree);
-    ret->cold->set_creator(tree);
+    Inode* ret = new RDepsDirInode(cold, tree, parent_tree);
     ret->cold->make_visible(tree);
     return ret;
   }
 
-  virtual bool visible(const char *name)
+  virtual bool visible(std::string name)
   {
     return cold->rdep(tree);
   }
@@ -658,32 +661,32 @@ struct RDepsDirInode : WorkDirInode {
 };
 
 struct BuildInode : public DirInode {
-  const char *tree;
+  std::string tree;
   std::unordered_map<std::string, Inode *> cache;
-  virtual Inode* lookup (const char *name, fuse_entry_param *e,
+  virtual Inode* lookup (std::string name, fuse_entry_param *e,
 			 CreateType create = CREATE_NONE)
   {
-    if (cache.count(std::string(name))) {
+    if (cache.count(name)) {
       e->attr.st_ino = 1;
       e->attr.st_mode = (DT_DIR << 12) | 0770;
-      return cache[std::string(name)];
+      return cache[name];
     }
-    if (strcmp(name, "work") == 0) {
+    if (name == "work") {
       e->attr.st_ino = 1;
       e->attr.st_mode = (DT_DIR << 12) | 0770;
-      return cache[std::string(name)] = new WorkDirInode(cold, tree, "hot");
+      return cache[name] = new WorkDirInode(cold, tree, "hot");
     }
-    if (strcmp(name, "new") == 0) {
+    if (name == "new") {
       e->attr.st_ino = 1;
       e->attr.st_mode = (DT_DIR << 12) | 0770;
-      return cache[std::string(name)] = new NewDirInode(cold, tree);
+      return cache[name] = new NewDirInode(cold, tree, "hot");
     }
-    if (strcmp(name, "rdeps") == 0) {
+    if (name == "rdeps") {
       e->attr.st_ino = 1;
       e->attr.st_mode = (DT_DIR << 12) | 0770;
-      Inode* inode = new RDepsDirInode(cold, tree);
+      Inode* inode = new RDepsDirInode(cold, tree, "hot");
       e->attr.st_mode = inode->mode(e->attr.st_mode);
-      cache[std::string(name)] = inode;
+      cache[name] = inode;
       return inode;
     }
 
@@ -699,26 +702,26 @@ struct BuildInode : public DirInode {
 
     Inode& inode = *this;
 
-    const char *entries[] = {
+    std::string entries[] = {
       "work", "new", "rdeps",
     };
 
     off_t count = 0;
-    for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++) {
+    for (std::string entry : entries) {
       if (count++ < offset)
 	continue;
       fuse_entry_param e {};
-      Inode *entry_inode = lookup(entries[i], &e);
+      Inode *entry_inode = lookup(entry, &e);
       if (!entry_inode)
 	continue;
       size_t entsize;
       if (plus) {
-	entsize = fuse_add_direntry_plus (req, p, rem, entries[i], &e, count);
+	entsize = fuse_add_direntry_plus (req, p, rem, entry.c_str(), &e, count);
 	if (entsize > rem) {
 	  abort();
 	}
       } else {
-	entsize = fuse_add_direntry(req, p, rem, entries[i], &e.attr, count);
+	entsize = fuse_add_direntry(req, p, rem, entry.c_str(), &e.attr, count);
 	if (entsize > rem) {
 	  abort();
 	}
@@ -734,28 +737,28 @@ struct BuildInode : public DirInode {
     fuse_reply_buf(req, ret, size);
     delete[] ret;
   }
-  BuildInode(ColdInode *cold, const char *tree) : DirInode(cold), tree(tree) {
+  BuildInode(ColdInode *cold, std::string tree) : DirInode(cold), tree(tree) {
     cold->set_creator(tree);
   }
 };
 
 struct BuildsInode : public DirInode {
   std::unordered_map<std::string, DirInode *> cache;
-  virtual Inode* lookup (const char *name, fuse_entry_param *e,
+  virtual Inode* lookup (std::string name, fuse_entry_param *e,
 			 CreateType create = CREATE_NONE)
   {
-    if (cache.count (std::string(name))) {
+    if (cache.count (name)) {
       e->attr.st_ino = 1;
       e->attr.st_mode = (DT_DIR << 12) | 0770;
-      return cache[std::string(name)];
+      return cache[name];
     }
 
     char *path;
-    asprintf (&path, "build/%s", name);
+    asprintf (&path, "build/%s", name.c_str());
     {
       if (fstatat (cold->dir_fd, path, &e->attr, 0) >= 0) {
 	free (path);
-	return cache[std::string(name)] = new BuildInode(cold, strdup (name));
+	return cache[name] = new BuildInode(cold, name);
       }
     }
 
@@ -766,7 +769,7 @@ struct BuildsInode : public DirInode {
 	::mkdirat (cold->dir_fd, "build", 0770);
 	::mkdirat (cold->dir_fd, path, 0770);
 	free (path);
-	return cache[std::string(name)] = new BuildInode(cold, strdup (name));
+	return cache[name] = new BuildInode(cold, name);
       }
 
     free (path);
@@ -820,28 +823,28 @@ struct BuildsInode : public DirInode {
 
 struct RootInode : public DirInode {
   std::unordered_map<std::string, Inode *> cache;
-  virtual Inode* lookup (const char *name, fuse_entry_param *e,
+  virtual Inode* lookup (std::string name, fuse_entry_param *e,
 			 CreateType create = CREATE_NONE)
   {
-    if (cache.count(std::string(name))) {
+    if (cache.count(name)) {
       e->attr.st_ino = 1;
       e->attr.st_mode = (DT_DIR << 12) | 0770;
-      return cache[std::string(name)];
+      return cache[name];
     }
-    if (strcmp(name, "hot") == 0) {
+    if (name == "hot") {
       e->attr.st_ino = 1;
       e->attr.st_mode = (DT_DIR << 12) | 0770;
-      return cache[std::string(name)] = new HotDirInode(cold);
+      return cache[name] = new HotDirInode(cold);
     }
-    if (strcmp(name, "meta") == 0) {
+    if (name == "meta") {
       e->attr.st_ino = 1;
       e->attr.st_mode = (DT_DIR << 12) | 0770;
-      return cache[std::string(name)] = new MetaInode(cold);
+      return cache[name] = new MetaInode(cold);
     }
-    if (strcmp(name, "build") == 0) {
+    if (name == "build") {
       e->attr.st_ino = 1;
       e->attr.st_mode = (DT_DIR << 12) | 0770;
-      return cache[std::string("build")] = new BuildsInode(cold);
+      return cache[name] = new BuildsInode(cold);
     }
 
     return nullptr;
@@ -856,7 +859,7 @@ struct RootInode : public DirInode {
 
     Inode& inode = *this;
 
-    const char *entries[] = {
+    std::string entries[] = {
       "hot", "meta", "build",
     };
 
@@ -870,12 +873,12 @@ struct RootInode : public DirInode {
 	continue;
       size_t entsize;
       if (plus) {
-	entsize = fuse_add_direntry_plus (req, p, rem, entries[i], &e, count);
+	entsize = fuse_add_direntry_plus (req, p, rem, entries[i].c_str(), &e, count);
 	if (entsize > rem) {
 	  abort();
 	}
       } else {
-	entsize = fuse_add_direntry(req, p, rem, entries[i], &e.attr, count);
+	entsize = fuse_add_direntry(req, p, rem, entries[i].c_str(), &e.attr, count);
 	if (entsize > rem) {
 	  abort();
 	}
@@ -892,7 +895,7 @@ struct RootInode : public DirInode {
     delete[] ret;
   }
   RootInode(ColdInode *cold) : DirInode(cold) {
-    cold->set_creator("root");
+    cold->set_creator("hot");
   }
 };
 
@@ -1047,10 +1050,10 @@ static void sfs_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
   do_setattr(req, ino, attr, valid, fi);
 }
 
-static int do_lookup(fuse_ino_t parent, const char *name,
+static int do_lookup(fuse_ino_t parent, std::string name,
 		     fuse_entry_param *e, CreateType create = CREATE_NONE) {
   char *fullpath;
-  asprintf (&fullpath, "%s/%s", get_inode(parent).toplevelpath ? : ".", name);
+  asprintf (&fullpath, "%s/%s", get_inode(parent).toplevelpath ? : ".", name.c_str());
   if (fs.debug)
     cerr << "DEBUG: lookup(): name=" << name
 	 << ", parent=" << parent << endl;
@@ -1217,11 +1220,31 @@ static void sfs_rename(fuse_req_t req, fuse_ino_t parent, const char *name,
   fuse_reply_err(req, res == -1 ? errno : 0);
 }
 
+static void delete_recursively (int fd, const char *name)
+{
+  if (::unlinkat(fd, name, 0) == 0)
+    return;
+  int dirfd;
+  DIR *dir = fdopendir (dirfd = openat (fd, name, O_DIRECTORY));
+  struct dirent *dirent;
+  while ((dirent = readdir(dir))) {
+    if (is_dot_or_dotdot (dirent->d_name))
+      continue;
+    delete_recursively (dirfd, dirent->d_name);
+  }
+  closedir (dir);
+  ::unlinkat(fd, name, AT_REMOVEDIR);
+}
+
 
 static void sfs_unlink(fuse_req_t req, fuse_ino_t parent, const char *name) {
-  Inode& inode_p = get_inode(parent);
-  auto res = unlinkat(inode_p.get_content_fd(), name, 0);
-  fuse_reply_err(req, res == -1 ? errno : 0);
+  Inode& inode = get_inode(parent);
+  if (!inode.modify()) {
+    fuse_reply_err(req, EIO);
+    return;
+  }
+  delete_recursively (inode.get_content_fd(), name);
+  fuse_reply_err(req, 0);
 }
 
 
@@ -1481,7 +1504,7 @@ static void sfs_write_buf(fuse_req_t req, fuse_ino_t ino, fuse_bufvec *in_buf,
 			  off_t off, fuse_file_info *fi) {
   Inode* inode = reinterpret_cast<Inode*>(ino);
   if (!inode->modify()) {
-    fuse_reply_err(req, -EIO);
+    fuse_reply_err(req, EIO);
     return;
   }
   (void) ino;

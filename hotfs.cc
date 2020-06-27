@@ -210,6 +210,12 @@ public:
     ::close (::openat (fd, where, O_CREAT|O_RDWR, 0660));
   }
 
+  virtual void make_rdep(const char *build)
+  {
+    int fd = get_rdeps_fd ();
+    ::close (::openat (fd, build, O_CREAT|O_RDWR, 0660));
+  }
+
   virtual bool visible(const char *name, const char *where)
   {
     char *path;
@@ -346,6 +352,14 @@ struct DirInode : public Inode {
     this->full = full;
   }
 
+  virtual bool child_visible(const char *name)
+  {
+    if (full->visible(name, get_tree()))
+      return true;
+
+    return false;
+  }
+
   virtual Inode* file_inode(int fd, const char *name) { while (true); }
   virtual Inode* dir_inode(FullDirInode *) { while (true); }
   virtual Inode* lookup(const char *name, fuse_entry_param *e,
@@ -357,7 +371,7 @@ struct DirInode : public Inode {
 		       AT_SYMLINK_NOFOLLOW);
 
     if (create == CREATE_FILE && res < 0) {
-      if (clash(name)) {
+      if (child_clash(name)) {
 	errno = EIO;
 	return nullptr;
       }
@@ -374,7 +388,7 @@ struct DirInode : public Inode {
       return nullptr;
     }
 
-    if (!full->visible(name, get_kind()))
+    if (!child_visible (name))
       return nullptr;
 
     if (S_ISDIR (e->attr.st_mode)) {
@@ -384,12 +398,12 @@ struct DirInode : public Inode {
     }
   }
 
-  virtual const char* get_kind()
+  virtual const char* get_tree()
   {
     return nullptr;
   }
 
-  virtual bool clash(const char *name) {
+  virtual bool child_clash(const char *name) {
     fuse_entry_param e {};
     Inode *inode = lookup (name, &e);
     if (!inode)
@@ -445,7 +459,7 @@ struct DirInode : public Inode {
 
 struct HotInode : public Inode {};
 struct HotDirInode : public DirInode {
-  virtual const char* get_kind()
+  virtual const char* get_tree()
   {
     return "hot";
   }
@@ -478,7 +492,7 @@ struct HotDirInode : public DirInode {
 		       AT_SYMLINK_NOFOLLOW);
 
     if (create == CREATE_FILE && res < 0) {
-      if (clash(name)) {
+      if (child_clash(name)) {
 	errno = EIO;
 	return nullptr;
       }
@@ -495,7 +509,7 @@ struct HotDirInode : public DirInode {
       return nullptr;
     }
 
-    if (!full->visible(name, "hot"))
+    if (!child_visible(name))
       return nullptr;
 
     if (S_ISDIR (e->attr.st_mode)) {
@@ -512,34 +526,42 @@ struct MetaInode : public DirInode {
 
 struct WorkInode : public Inode {};
 struct WorkDirInode : public DirInode {
-  const char *id;
-  char *kind;
+  const char *build;
+  const char *parent_tree;
+  const char *tree;
+
+  virtual bool child_visible(const char *name)
+  {
+    return (DirInode::child_visible(name) ||
+	    full->visible(name, parent_tree));
+  }
 
   virtual Inode* file_inode(int fd, const char *name)
   {
     Inode* ret = new WorkInode();
     ret->full = new FullInode (fd, name);
-    ret->full->set_creator(id);
-    ret->full->make_visible(id);
+    ret->full->set_creator(build);
+    ret->full->make_visible(build);
+    ret->full->make_rdep(build);
     return ret;
   }
 
   virtual Inode* dir_inode(FullDirInode *full)
   {
-    Inode* ret = new WorkDirInode(full, id);
-    ret->full->set_creator(id);
-    ret->full->make_visible(id);
+    Inode* ret = new WorkDirInode(full, build, parent_tree);
+    ret->full->set_creator(build);
+    ret->full->make_visible(build);
+    ret->full->make_rdep(build);
     return ret;
   }
 
-  virtual const char *get_kind()
+  virtual const char *get_tree()
   {
-    if (kind == nullptr)
-      asprintf(&kind, "%s", id);
-    return kind;
+    return build;
   }
 
-  WorkDirInode(FullInode *full, const char *id) : DirInode(full), id(id) {
+  WorkDirInode(FullInode *full, const char *id, const char *parent_tree)
+    : DirInode(full), build(id), parent_tree(parent_tree) {
     char *creator;
     asprintf(&creator, "%s", id);
     full->set_creator(creator);
@@ -548,7 +570,7 @@ struct WorkDirInode : public DirInode {
 
   virtual void finish_build() {
     char *creator;
-    asprintf(&creator, "finished build %s", id);
+    asprintf(&creator, "finished build %s", build);
     full->set_creator(creator);
     free (creator);
   }
@@ -557,55 +579,55 @@ struct WorkDirInode : public DirInode {
 struct NewInode : WorkInode {
 };
 struct NewDirInode : WorkDirInode {
-  NewDirInode(FullInode *full, const char *id) : WorkDirInode(full, id) {}
+  NewDirInode(FullInode *full, const char *id) : WorkDirInode(full, id, nullptr) {}
 
   virtual Inode* file_inode(int fd, const char *name)
   {
     Inode* ret = new NewInode();
     ret->full = new FullInode (fd, name);
-    ret->full->set_creator(id);
-    ret->full->make_visible(id);
+    ret->full->set_creator(build);
+    ret->full->make_visible(build);
     return ret;
   }
 
   virtual Inode* dir_inode(FullDirInode *full)
   {
-    Inode* ret = new NewDirInode(full, id);
-    ret->full->set_creator(id);
-    ret->full->make_visible(id);
+    Inode* ret = new NewDirInode(full, build);
+    ret->full->set_creator(build);
+    ret->full->make_visible(build);
     return ret;
   }
 
   virtual bool visible(const char *name)
   {
-    return strcmp (full->get_creator(), id) == 0;
+    return strcmp (full->get_creator(), build) == 0;
   }
 };
 
 struct RDepsInode : WorkInode {};
 struct RDepsDirInode : WorkDirInode {
-  RDepsDirInode(FullInode *full, const char *id) : WorkDirInode(full, id) {}
+  RDepsDirInode(FullInode *full, const char *id) : WorkDirInode(full, id, nullptr) {}
 
   virtual Inode* file_inode(int fd, const char *name)
   {
     Inode* ret = new RDepsInode();
     ret->full = new FullInode (fd, name);
-    ret->full->set_creator(id);
-    ret->full->make_visible(id);
+    ret->full->set_creator(build);
+    ret->full->make_visible(build);
     return ret;
   }
 
   virtual Inode* dir_inode(FullDirInode *full)
   {
-    Inode* ret = new RDepsDirInode(full, id);
-    ret->full->set_creator(id);
-    ret->full->make_visible(id);
+    Inode* ret = new RDepsDirInode(full, build);
+    ret->full->set_creator(build);
+    ret->full->make_visible(build);
     return ret;
   }
 
   virtual bool visible(const char *name)
   {
-    return full->rdep(id);
+    return full->rdep(build);
   }
 };
 
@@ -623,7 +645,7 @@ struct BuildInode : public DirInode {
     if (strcmp(name, "work") == 0) {
       e->attr.st_ino = 1;
       e->attr.st_mode = (DT_DIR << 12) | 0770;
-      return cache[std::string(name)] = new WorkDirInode(full, id);
+      return cache[std::string(name)] = new WorkDirInode(full, id, "hot");
     }
     if (strcmp(name, "new") == 0) {
       e->attr.st_ino = 1;
@@ -703,7 +725,7 @@ struct BuildsInode : public DirInode {
       {
 	e->attr.st_ino = 1;
 	e->attr.st_mode = (DT_DIR << 12) | 0770;
-	return cache[std::string(name)] = new BuildInode(full, name);
+	return cache[std::string(name)] = new BuildInode(full, strdup (name));
       }
 
     return nullptr;

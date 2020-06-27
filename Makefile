@@ -9,11 +9,11 @@ all: hotfs.exe
 test: hotfs.exe
 	mkdir hot
 	mkdir cold
-	touch cold/mounted
+	mkdir cold/cold
+	mkdir cold/cold/mounted
+	touch cold/cold/mounted/cold
 	echo "a: b ; echo hello world > a" > cold/Makefile
 	./hotfs.exe cold hot &
-	while ! [ -e hot/mounted ]; do sleep 1; done
-	touch hot/b
-	cat hot/a
+	while ! [ -e hot/hot/mounted ]; do sleep 1; done
 	umount hot
 

@@ -655,11 +655,8 @@ struct DirInode : public Inode {
     return false;
   }
 
-  virtual Inode* file_inode(ColdInode *, bool = false)
-  {
-    while (true);
-  }
-  virtual Inode* dir_inode(ColdDirInode *) { while (true); }
+  virtual Inode* file_inode(ColdInode *, bool = false) { while(true); }
+  virtual Inode* dir_inode(ColdDirInode *) { while(true); }
   virtual Inode* lookup(std::string name, mode_t *mode = nullptr)
   {
     char *path;
@@ -680,9 +677,9 @@ struct DirInode : public Inode {
 		    AT_SYMLINK_NOFOLLOW);
       Inode* ret = file_inode(new ColdInode(cold->get_content_fd(), name),
 			      true);
-      ret->get_fuse_entry_param()->ino = reinterpret_cast<fuse_ino_t>(ret);
       ret->cold->set_creator (get_tree());
       ret->entry_param = ep;
+      ret->get_fuse_entry_param()->ino = reinterpret_cast<fuse_ino_t>(ret);
       return ret;
     } else if (mode && S_ISDIR(*mode) && res < 0) {
       if (child_clash(name)) {
@@ -694,8 +691,8 @@ struct DirInode : public Inode {
       res = fstatat(cold->get_content_fd (), path, &e->attr,
 		    AT_SYMLINK_NOFOLLOW);
       Inode* ret = dir_inode(new ColdDirInode(cold->get_content_fd(), name.c_str()));
-      ret->get_fuse_entry_param()->ino = reinterpret_cast<fuse_ino_t>(ret);
       ret->entry_param = ep;
+      ret->get_fuse_entry_param()->ino = reinterpret_cast<fuse_ino_t>(ret);
       return ret;
     }
 
@@ -710,13 +707,13 @@ struct DirInode : public Inode {
 
     if (S_ISDIR (e->attr.st_mode)) {
       Inode* ret = dir_inode(new ColdDirInode (cold->get_content_fd(), name));
-      ret->get_fuse_entry_param()->ino = reinterpret_cast<fuse_ino_t>(ret);
       ret->entry_param = ep;
+      ret->get_fuse_entry_param()->ino = reinterpret_cast<fuse_ino_t>(ret);
       return ret;
     } else {
       Inode* ret = file_inode(new ColdInode (cold->get_content_fd(), name));
-      ret->get_fuse_entry_param()->ino = reinterpret_cast<fuse_ino_t>(ret);
       ret->entry_param = ep;
+      ret->get_fuse_entry_param()->ino = reinterpret_cast<fuse_ino_t>(ret);
       return ret;
     }
   }
@@ -859,9 +856,9 @@ struct WorkDirInode : public DirInode {
 	    cold->visible(name, parent_tree));
   }
 
-  virtual Inode* file_inode(int fd, std::string name, bool is_new = false)
+  virtual Inode* file_inode(ColdInode *cold, bool is_new = false)
   {
-    Inode* ret = new WorkInode(new ColdInode (fd, name), tree, parent_tree);
+    Inode* ret = new WorkInode(cold, tree, parent_tree);
     ret->cold->make_visible(tree);
     if (!is_new)
       ret->cold->make_rdep(tree);
@@ -903,9 +900,9 @@ struct NewDirInode : WorkDirInode {
   NewDirInode(ColdInode *cold, std::string tree, std::string parent_tree)
     : WorkDirInode(cold, tree, parent_tree) {}
 
-  virtual Inode* file_inode(int fd, std::string name, bool = false)
+  virtual Inode* file_inode(ColdInode *cold, bool = false)
   {
-    Inode* ret = new NewInode(new ColdInode (fd, name), tree, parent_tree);
+    Inode* ret = new NewInode(cold, tree, parent_tree);
     ret->cold->make_visible(tree);
     return ret;
   }
@@ -931,9 +928,9 @@ struct RDepsDirInode : WorkDirInode {
   RDepsDirInode(ColdInode *cold, std::string tree, std::string parent_tree)
     : WorkDirInode(cold, tree, parent_tree) {}
 
-  virtual Inode* file_inode(int fd, std::string name, bool = false)
+  virtual Inode* file_inode(ColdInode *cold, bool = false)
   {
-    Inode* ret = new RDepsInode(new ColdInode (fd, name), tree, parent_tree);
+    Inode* ret = new RDepsInode(cold, tree, parent_tree);
     ret->cold->make_visible(tree);
     return ret;
   }
@@ -1064,8 +1061,7 @@ struct BuildsInode : public DirInode {
     char *p = ret;
     auto rem = size;
 
-    Inode& inode = *this;
-    DIR *dir = fdopendir (inode.get_content_fd());
+    DIR *dir = fdopendir (get_content_fd());
 
     seekdir (dir, 0);
     off_t count = 0;
@@ -1073,18 +1069,17 @@ struct BuildsInode : public DirInode {
     for (const auto &n : cache) {
       if (count++ < offset)
 	continue;
-      fuse_entry_param e {};
       Inode *entry_inode = lookup(n.first);
       if (!entry_inode)
 	continue;
       size_t entsize;
       if (plus) {
-	entsize = fuse_add_direntry_plus (req, p, rem, n.first.c_str(), &e, count);
+	entsize = fuse_add_direntry_plus (req, p, rem, n.first.c_str(), entry_inode->get_fuse_entry_param(), count);
 	if (entsize > rem) {
 	  abort();
 	}
       } else {
-	entsize = fuse_add_direntry(req, p, rem, n.first.c_str(), &e.attr, count);
+	entsize = fuse_add_direntry(req, p, rem, n.first.c_str(), entry_inode->get_attr(), count);
 	if (entsize > rem) {
 	  abort();
 	}
@@ -1221,6 +1216,8 @@ static void mknod_symlink(fuse_req_t req, fuse_ino_t parent,
   DirInode& inode_p = get_dir_inode(parent);
   if (S_ISDIR(mode)) {
     Inode* inode = inode_p.lookup(name, &mode);
+    if (!inode)
+      throw Errno(errno);
     inode->get_fuse_entry_param()->ino =
       reinterpret_cast<fuse_ino_t>(inode);
     fuse_reply_entry (req, inode->get_fuse_entry_param());
@@ -1234,6 +1231,8 @@ static void mknod_symlink(fuse_req_t req, fuse_ino_t parent,
     if (res == -1)
       throw Errno(errno);
     Inode* inode = inode_p.lookup(name);
+    if (!inode)
+      throw Errno(errno);
     fuse_reply_entry(req, inode->get_fuse_entry_param());
   } catch (Errno error) {
     fuse_reply_err(req, error.error);
@@ -1247,12 +1246,6 @@ static void sfs_mknod(fuse_req_t req, fuse_ino_t parent, const char *name,
 }
 
 
-static void sfs_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name,
-		      mode_t mode) {
-  mknod_symlink(req, parent, name, S_IFDIR | mode, 0, nullptr);
-}
-
-
 static void sfs_symlink(fuse_req_t req, const char *link, fuse_ino_t parent,
 			const char *name) {
   mknod_symlink(req, parent, name, S_IFLNK, 0, link);
@@ -1263,10 +1256,6 @@ static void sfs_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t parent,
 		     const char *name) {
   Inode& inode = get_inode(ino);
   Inode& inode_p = get_inode(parent);
-  fuse_entry_param e {};
-
-  e.attr_timeout = fs.timeout;
-  e.entry_timeout = fs.timeout;
 
   char procname[64];
   sprintf(procname, "/proc/self/fd/%i", inode.get_content_fd());
@@ -1276,18 +1265,17 @@ static void sfs_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t parent,
     return;
   }
 
-  res = fstatat(inode.get_content_fd (), "", &e.attr, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
+  res = fstatat(inode.get_content_fd (), "", inode.get_attr(), AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
   if (res == -1) {
     fuse_reply_err(req, errno);
     return;
   }
-  e.ino = reinterpret_cast<fuse_ino_t>(&inode);
   {
     lock_guard<mutex> g {inode.m};
     inode.nlookup++;
   }
 
-  fuse_reply_entry(req, &e);
+  fuse_reply_entry(req, inode.get_fuse_entry_param());
   return;
 }
 
@@ -1346,7 +1334,7 @@ static void forget_one(fuse_ino_t ino, uint64_t n) {
   Inode& inode = get_inode(ino);
   unique_lock<mutex> l {inode.m};
 
-  if(n > inode.nlookup) {
+  if(false && n > inode.nlookup) {
     cerr << "INTERNAL ERROR: Negative lookup count for inode "
 	 << inode.src_ino << endl;
     abort();
@@ -1489,7 +1477,10 @@ static void sfs_create(fuse_req_t req, fuse_ino_t parent, const char *name,
   Inode* inode_p = reinterpret_cast<Inode*>(parent);
   try {
     Inode* inode = inode_p->lookup(std::string(name), &mode);
-    fuse_reply_entry(req, inode->get_fuse_entry_param());
+    if (!inode)
+      fuse_reply_entry(req, inode->empty_entry_param());
+    else
+      fuse_reply_entry(req, inode->get_fuse_entry_param());
   } catch (ErrorInode* error) {
     if (error->get_error() == ENOENT)
       fuse_reply_entry(req, error->get_fuse_entry_param());
@@ -1594,13 +1585,13 @@ static void do_write_buf(fuse_req_t req, size_t size, off_t off,
 
 static void sfs_write_buf(fuse_req_t req, fuse_ino_t ino, fuse_bufvec *in_buf,
 			  off_t off, fuse_file_info *fi) {
-  Inode* inode = reinterpret_cast<Inode*>(ino);
-  if (!inode->modify()) {
+  Inode& inode = get_inode(ino);
+  if (!inode.modify()) {
     fuse_reply_err(req, EIO);
     return;
   }
   auto size {fuse_buf_size(in_buf)};
-  do_write_buf(req, size, off, in_buf, inode->cold->get_content_fd());
+  do_write_buf(req, size, off, in_buf, inode.cold->get_content_fd());
 }
 
 

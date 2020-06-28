@@ -167,10 +167,15 @@ struct Cold {
     return fd;
   }
 
+  void create_version(std::string version, std::string from)
+  {
+    symlinkat(from.c_str(), get_versions_fd(), version.c_str());
+  }
+
   int get_version_fd(std::string version)
   {
     int versions_fd = get_versions_fd();
-    int fd = ::openat(versions_fd, version.c_str(), O_DIRECTORY);
+    int fd = ::openat(versions_fd, version.c_str(), 0);
     if (fd < 0) {
       ::mkdirat(versions_fd, version.c_str(), dir_mode);
       return get_version_fd(version);
@@ -265,6 +270,11 @@ struct Hot {
 };
 
 struct HotDir : public Hot {
+  virtual bool not_found(std::string, mode_t*)
+  {
+    return false;
+  }
+
   int get_readdir_fd()
   {
     return get_versioned_fd("content", &dir_mode);
@@ -284,6 +294,7 @@ struct HotDir : public Hot {
 
   virtual Hot* lookup(std::string name, mode_t *create = nullptr)
   {
+  again:
     int content_fd = get_readdir_fd();
     if (content_fd < 0)
       return nullptr;
@@ -302,8 +313,11 @@ struct HotDir : public Hot {
       return lookup(name, create);
     }
 
-    if (fd < 0)
+    if (fd < 0) {
+      if (not_found(name, create))
+	goto again;
       return nullptr;
+    }
 
     return new_hot(new_cold(fd), version);
   }
@@ -371,8 +385,20 @@ struct HotDirNonbacked : public HotDir {
     *size = p - buf;
   }
 
-  HotDirNonbacked(Cold *cold)
-    : HotDir(cold, "hot")
+  HotDirNonbacked(Cold *cold, std::string version = "hot")
+    : HotDir(cold, version)
+  {}
+};
+
+struct HotNew : public HotDir {
+  HotNew(Cold* cold, std::string version)
+    : HotDir(cold, version)
+  {}
+};
+
+struct HotDeps : public HotDir {
+  HotDeps(Cold* cold, std::string version)
+    : HotDir(cold, version)
   {}
 };
 
@@ -384,11 +410,20 @@ struct HotBuild : public HotDirNonbacked {
 
   virtual Hot* lookup(std::string name, mode_t *create = nullptr)
   {
+    if (name == "work") {
+      return new HotDir(cold, version);
+    }
+    if (name == "new") {
+      return new HotNew(cold, version);
+    }
+    if (name == "deps") {
+      return new HotDeps(cold, version);
+    }
     return nullptr;
   }
 
   HotBuild(Cold* cold, std::string version)
-    : HotDirNonbacked(cold)
+    : HotDirNonbacked(cold, version)
   {
     this->version = version;
   }
@@ -402,12 +437,14 @@ struct HotBuilds : public HotDirNonbacked {
 
   virtual Hot* lookup(std::string name, mode_t *create = nullptr)
   {
+    cold->create_version(name, "hot");
     return new HotBuild(cold, name);
   }
 
   HotBuilds(Cold *cold)
     : HotDirNonbacked(cold)
-  {}
+  {
+  }
 };
 
 struct HotRoot : public HotDirNonbacked {

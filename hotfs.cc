@@ -69,8 +69,11 @@ static bool is_dot_or_dotdot(std::string name) {
 
 /* Forward declarations */
 struct Inode;
+struct DirInode;
 static Inode& get_inode(fuse_ino_t ino);
 static void forget_one(fuse_ino_t ino, uint64_t n);
+
+static DirInode& get_dir_inode(fuse_ino_t ino);
 
 class BuildManager {
 private:
@@ -520,6 +523,12 @@ struct Inode {
       fuse_reply_err(req, error.error);
     }
   }
+
+  static void fuse_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
+			   off_t offset, fuse_file_info *fi);
+
+  static void fuse_readdirplus(fuse_req_t req, fuse_ino_t ino, size_t size,
+			       off_t offset, fuse_file_info *fi);
 
   static void fuse_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name,
 			 mode_t mode)
@@ -1181,13 +1190,6 @@ static Inode& get_inode(fuse_ino_t ino) {
   return *inode;
 }
 
-static DirInode& get_dir_inode(fuse_ino_t ino) {
-  if (ino == 1)
-    return *fs.root;
-  DirInode* inode = dynamic_cast<DirInode*>(reinterpret_cast<Inode*>(ino));
-  return *inode;
-}
-
 static void sfs_init(void *userdata, fuse_conn_info *conn) {
   (void)userdata;
   if (conn->capable & FUSE_CAP_EXPORT_SUPPORT)
@@ -1208,6 +1210,13 @@ static void sfs_init(void *userdata, fuse_conn_info *conn) {
     conn->want |= FUSE_CAP_SPLICE_READ;
 }
 
+
+static DirInode& get_dir_inode(fuse_ino_t ino) {
+  if (ino == 1)
+    return *fs.root;
+  DirInode* inode = dynamic_cast<DirInode*>(reinterpret_cast<Inode*>(ino));
+  return *inode;
+}
 
 static void mknod_symlink(fuse_req_t req, fuse_ino_t parent,
 			  const char *name, mode_t mode, dev_t rdev,
@@ -1442,26 +1451,6 @@ static void sfs_opendir(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi) {
   fuse_reply_err(req, error);
 }
 
-
-static void do_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
-		       off_t offset, fuse_file_info *fi, int plus) {
-  DirInode& inode = get_dir_inode(ino);
-  inode.readdir(req, size, offset, fi, plus);
-}
-
-
-static void sfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
-			off_t offset, fuse_file_info *fi) {
-  // operation logging is done in readdir to reduce code duplication
-  do_readdir(req, ino, size, offset, fi, 0);
-}
-
-
-static void sfs_readdirplus(fuse_req_t req, fuse_ino_t ino, size_t size,
-			    off_t offset, fuse_file_info *fi) {
-  // operation logging is done in readdir to reduce code duplication
-  do_readdir(req, ino, size, offset, fi, 1);
-}
 
 
 static void sfs_releasedir(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi) {
@@ -1761,8 +1750,8 @@ static void assign_operations(fuse_lowlevel_ops &sfs_oper) {
   sfs_oper.setattr = Inode::fuse_setattr;
   sfs_oper.readlink = sfs_readlink;
   sfs_oper.opendir = sfs_opendir;
-  sfs_oper.readdir = sfs_readdir;
-  sfs_oper.readdirplus = sfs_readdirplus;
+  sfs_oper.readdir = Inode::fuse_readdir;
+  sfs_oper.readdirplus = Inode::fuse_readdirplus;
   sfs_oper.releasedir = sfs_releasedir;
   sfs_oper.fsyncdir = sfs_fsyncdir;
   sfs_oper.create = sfs_create;
@@ -1917,4 +1906,16 @@ int main(int argc, char *argv[]) {
   fuse_opt_free_args(&args);
 
   return ret ? 1 : 0;
+}
+
+void Inode::fuse_readdirplus(fuse_req_t req, fuse_ino_t ino, size_t size,
+				    off_t offset, fuse_file_info *fi)
+{
+  get_dir_inode(ino).readdir(req, size, offset, fi, true);
+}
+
+void Inode::fuse_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
+				    off_t offset, fuse_file_info *fi)
+{
+  get_dir_inode(ino).readdir(req, size, offset, fi, false);
 }

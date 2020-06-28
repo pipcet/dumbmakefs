@@ -417,9 +417,43 @@ struct ColdDirInode : public ColdInode {
     : ColdInode (::openat(fd, path.c_str(), 0, 0770)) {}
 };
 
+class Errno {
+public:
+  int error;
+
+  Errno(int error) : error(error) {}
+};
+
+class RootInode;
+struct Fs {
+  // Must be acquired *after* any Inode.m locks.
+  std::mutex mutex;
+  std::unordered_map<std::string, int> making;
+  RootInode *root;
+  double timeout;
+  bool debug;
+  std::string source;
+  size_t blocksize;
+  dev_t src_dev;
+  bool nosplice;
+  bool nocache;
+};
+static Fs fs{};
+
+
 struct Inode {
   ColdInode *cold;
   struct stat attr;
+
+  ino_t get_ino()
+  {
+    return reinterpret_cast<ino_t>(this);
+  }
+
+  fuse_ino_t get_fuse_ino()
+  {
+    return reinterpret_cast<fuse_ino_t>(this);
+  }
 
   virtual mode_t mode(mode_t mode)
   {
@@ -455,9 +489,127 @@ struct Inode {
 
   std::mutex m;
 
+  virtual Inode* lookup(std::string, mode_t* = nullptr) { abort(); }
+
+  static fuse_entry_param* empty_entry_param()
+  {
+    static fuse_entry_param e {};
+    return &e;
+  }
+
+  fuse_entry_param entry_param {};
+  fuse_entry_param *get_fuse_entry_param()
+  {
+    return &entry_param;
+  }
+
+  auto get_attr()
+  {
+    return &get_fuse_entry_param()->attr;
+  }
+
+  static void fuse_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
+  {
+    Inode& inode = get_inode(parent);
+    try {
+      Inode* ret = inode.lookup(name);
+      if (ret)
+	fuse_reply_entry(req, ret->get_fuse_entry_param());
+      else
+	fuse_reply_entry(req, empty_entry_param());
+    } catch (Errno error) {
+      fuse_reply_err(req, error.error);
+    }
+  }
+
+  static void fuse_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name,
+			 mode_t mode)
+  {
+    mode |= (DT_DIR << 12);
+    Inode& inode = get_inode(parent);
+    try {
+      Inode* ret = inode.lookup(name, &mode);
+      if (ret)
+	fuse_reply_entry(req, ret->get_fuse_entry_param());
+      else
+	fuse_reply_entry(req, empty_entry_param());
+    } catch (Errno error) {
+      fuse_reply_err(req, error.error);
+    }
+  }
+
+  static void fuse_getattr(fuse_req_t req, fuse_ino_t ino, fuse_file_info *) {
+    Inode& inode = get_inode(ino);
+    auto res = fstatat(inode.cold->get_content_fd (), "", inode.get_attr(),
+		       AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
+    if (res == -1) {
+      fuse_reply_err(req, errno);
+      return;
+    }
+    fuse_reply_attr(req, inode.get_attr(), fs.timeout);
+  }
+
+  static void fuse_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
+			   int valid, fuse_file_info *fi) {
+    Inode& inode = get_inode(ino);
+    int ifd = inode.get_content_fd();
+    int res;
+
+    if (valid & FUSE_SET_ATTR_MODE) {
+      res = fchmod(ifd, attr->st_mode);
+      if (res == -1)
+	goto out_err;
+    }
+    if (valid & (FUSE_SET_ATTR_UID | FUSE_SET_ATTR_GID)) {
+      uid_t uid = (valid & FUSE_SET_ATTR_UID) ? attr->st_uid : static_cast<uid_t>(-1);
+      gid_t gid = (valid & FUSE_SET_ATTR_GID) ? attr->st_gid : static_cast<gid_t>(-1);
+
+      res = fchownat(ifd, "", uid, gid, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
+      if (res == -1)
+	goto out_err;
+    }
+    if (valid & FUSE_SET_ATTR_SIZE) {
+      res = ftruncate(ifd, attr->st_size);
+      if (res == -1)
+	goto out_err;
+    }
+    if (valid & (FUSE_SET_ATTR_ATIME | FUSE_SET_ATTR_MTIME)) {
+      struct timespec tv[2];
+
+      tv[0].tv_sec = 0;
+      tv[1].tv_sec = 0;
+      tv[0].tv_nsec = UTIME_OMIT;
+      tv[1].tv_nsec = UTIME_OMIT;
+
+      if (valid & FUSE_SET_ATTR_ATIME_NOW)
+	tv[0].tv_nsec = UTIME_NOW;
+      else if (valid & FUSE_SET_ATTR_ATIME)
+	tv[0] = attr->st_atim;
+
+      if (valid & FUSE_SET_ATTR_MTIME_NOW)
+	tv[1].tv_nsec = UTIME_NOW;
+      else if (valid & FUSE_SET_ATTR_MTIME)
+	tv[1] = attr->st_mtim;
+
+      res = futimens(ifd, tv);
+      if (res == -1)
+	goto out_err;
+    }
+    return Inode::fuse_getattr(req, ino, fi);
+
+  out_err:
+    fuse_reply_err(req, errno);
+  }
+
+
   // Delete copy constructor and assignments. We could implement
   // move if we need it.
-  Inode() = default;
+  Inode()
+  {
+    get_fuse_entry_param()->ino = get_fuse_ino();
+    get_fuse_entry_param()->attr.st_ino = get_ino();
+    get_fuse_entry_param()->attr.st_mode = (DT_DIR << 12) | 0770;
+  }
   Inode(const Inode&) = delete;
   Inode(Inode&& inode) = delete;
   Inode& operator=(Inode&& inode) = delete;
@@ -485,8 +637,10 @@ static std::unordered_map<int, Inode *>error_cache;
 enum CreateType { CREATE_NONE, CREATE_DIR, CREATE_FILE };
 
 struct DirInode : public Inode {
-  DirInode(ColdInode *cold) {
+  DirInode(ColdInode *cold)
+    : Inode() {
     this->cold = cold;
+    this->get_attr()->st_mode = (DT_DIR << 12) | 0770;
   }
 
   virtual bool child_visible(std::string name)
@@ -502,15 +656,16 @@ struct DirInode : public Inode {
     while (true);
   }
   virtual Inode* dir_inode(ColdDirInode *) { while (true); }
-  virtual Inode* lookup(std::string name, fuse_entry_param *e,
-			CreateType create = CREATE_NONE)
+  virtual Inode* lookup(std::string name, mode_t *mode = nullptr)
   {
     char *path;
+    fuse_entry_param ep {};
+    fuse_entry_param *e = &ep;
     asprintf(&path, "%s/content", name.c_str());
     auto res = fstatat(cold->get_content_fd (), path, &e->attr,
 		       AT_SYMLINK_NOFOLLOW);
 
-    if (create == CREATE_FILE && res < 0) {
+    if (mode && S_ISREG(*mode)) {
       if (child_clash(name)) {
 	errno = EIO;
 	return nullptr;
@@ -520,10 +675,12 @@ struct DirInode : public Inode {
       res = fstatat(cold->get_content_fd (), path, &e->attr,
 		    AT_SYMLINK_NOFOLLOW);
       Inode* ret = file_inode(cold->get_content_fd(), name, true);
+      ret->get_fuse_entry_param()->ino = reinterpret_cast<fuse_ino_t>(ret);
       ret->cold->set_creator (get_tree());
       e->attr.st_mode = ret->mode(e->attr.st_mode);
+      ret->entry_param = ep;
       return ret;
-    } else if (create == CREATE_DIR && res < 0) {
+    } else if (mode && S_ISDIR(*mode) && res < 0) {
       if (child_clash(name)) {
 	errno = EIO;
 	return nullptr;
@@ -533,7 +690,9 @@ struct DirInode : public Inode {
       res = fstatat(cold->get_content_fd (), path, &e->attr,
 		    AT_SYMLINK_NOFOLLOW);
       Inode* ret = dir_inode(new ColdDirInode(cold->get_content_fd(), name.c_str()));
+      ret->get_fuse_entry_param()->ino = reinterpret_cast<fuse_ino_t>(ret);
       e->attr.st_mode = ret->mode(e->attr.st_mode);
+      ret->entry_param = ep;
       return ret;
     }
 
@@ -548,11 +707,15 @@ struct DirInode : public Inode {
 
     if (S_ISDIR (e->attr.st_mode)) {
       Inode* ret = dir_inode(new ColdDirInode (cold->get_content_fd(), name));
+      ret->get_fuse_entry_param()->ino = reinterpret_cast<fuse_ino_t>(ret);
       e->attr.st_mode = ret->mode(e->attr.st_mode);
+      ret->entry_param = ep;
       return ret;
     } else {
       Inode* ret = file_inode(cold->get_content_fd(), name);
+      ret->get_fuse_entry_param()->ino = reinterpret_cast<fuse_ino_t>(ret);
       e->attr.st_mode = ret->mode(e->attr.st_mode);
+      ret->entry_param = ep;
       return ret;
     }
   }
@@ -563,8 +726,7 @@ struct DirInode : public Inode {
   }
 
   virtual bool child_clash(std::string name) {
-    fuse_entry_param e {};
-    Inode *inode = lookup (name, &e);
+    Inode *inode = lookup (name);
     if (!inode)
       return false;
     std::cerr << "Name clash!\n";
@@ -591,18 +753,17 @@ struct DirInode : public Inode {
 	continue;
       if (entry->d_type != DT_DIR)
 	continue;
-      fuse_entry_param e {};
-      Inode *entry_inode = lookup (entry->d_name, &e);
+      Inode *entry_inode = lookup (entry->d_name);
       if (!entry_inode)
 	continue;
       size_t entsize;
       if (plus) {
-	entsize = fuse_add_direntry_plus (req, p, rem, entry->d_name, &e, count);
+	entsize = fuse_add_direntry_plus (req, p, rem, entry->d_name, entry_inode->get_fuse_entry_param(), count);
 	if (entsize > rem) {
 	  abort();
 	}
       } else {
-	entsize = fuse_add_direntry(req, p, rem, entry->d_name, &e.attr, count);
+	entsize = fuse_add_direntry(req, p, rem, entry->d_name, &entry_inode->get_fuse_entry_param()->attr, count);
 	if (entsize > rem) {
 	  abort();
 	}
@@ -618,26 +779,30 @@ struct DirInode : public Inode {
 
 struct HotInode : public Inode {};
 struct HotDirInode : public DirInode {
-  virtual Inode* lookup(std::string name, fuse_entry_param *e,
-			CreateType create = CREATE_NONE)
+  virtual Inode* lookup(std::string name, mode_t *mode = nullptr)
   {
-    Inode* ret = DirInode::lookup(name, e, CREATE_NONE);
+    Inode* ret = DirInode::lookup(name);
     if (ret == nullptr) {
       build_file (name);
     }
-    ret = DirInode::lookup(name, e, CREATE_NONE);
-    if (ret == nullptr && create != CREATE_NONE) {
-      ret = DirInode::lookup(name, e, create);
+    ret = DirInode::lookup(name);
+    if (ret == nullptr && mode) {
+      ret = DirInode::lookup(name, mode);
     }
     return ret;
   }
-  
+
   virtual const std::string get_tree()
   {
     return "hot";
   }
 
-  HotDirInode(ColdInode *cold) : DirInode (cold) {}
+  HotDirInode(ColdInode *cold) : DirInode (cold)
+  {
+    get_fuse_entry_param()->ino = get_fuse_ino();
+    get_attr()->st_ino = get_ino();
+    get_attr()->st_mode = (DT_DIR << 12) | 0770;
+  }
 
   virtual bool modify()
   {
@@ -660,10 +825,6 @@ struct HotDirInode : public DirInode {
     ret->cold->make_visible("hot");
     return ret;
   }
-};
-
-struct MetaInode : public DirInode {
-  MetaInode(ColdInode *cold) : DirInode(cold) {}
 };
 
 struct WorkInode : public Inode {
@@ -717,7 +878,8 @@ struct WorkDirInode : public DirInode {
   }
 
   WorkDirInode(ColdInode *cold, std::string tree, std::string parent_tree)
-    : DirInode(cold), tree(tree), parent_tree(parent_tree) {
+    : DirInode(cold), tree(tree), parent_tree(parent_tree)
+  {
   }
 
   virtual void finish_build() {
@@ -790,31 +952,19 @@ struct RDepsDirInode : WorkDirInode {
 struct BuildInode : public DirInode {
   std::string tree;
   std::unordered_map<std::string, Inode *> cache;
-  virtual Inode* lookup (std::string name, fuse_entry_param *e,
-			 CreateType create = CREATE_NONE)
+  virtual Inode* lookup (std::string name, mode_t *create = nullptr)
   {
     if (cache.count(name)) {
-      e->attr.st_ino = 1;
-      e->attr.st_mode = (DT_DIR << 12) | 0770;
       return cache[name];
     }
     if (name == "work") {
-      e->attr.st_ino = 1;
-      e->attr.st_mode = (DT_DIR << 12) | 0770;
       return cache[name] = new WorkDirInode(cold, tree, "hot");
     }
     if (name == "new") {
-      e->attr.st_ino = 1;
-      e->attr.st_mode = (DT_DIR << 12) | 0770;
       return cache[name] = new NewDirInode(cold, tree, "hot");
     }
     if (name == "rdeps") {
-      e->attr.st_ino = 1;
-      e->attr.st_mode = (DT_DIR << 12) | 0770;
-      Inode* inode = new RDepsDirInode(cold, tree, "hot");
-      e->attr.st_mode = inode->mode(e->attr.st_mode);
-      cache[name] = inode;
-      return inode;
+      return cache[name] = new RDepsDirInode(cold, tree, "hot");
     }
 
     return nullptr;
@@ -837,18 +987,17 @@ struct BuildInode : public DirInode {
     for (std::string entry : entries) {
       if (count++ < offset)
 	continue;
-      fuse_entry_param e {};
-      Inode *entry_inode = lookup(entry, &e);
+      Inode *entry_inode = lookup(entry);
       if (!entry_inode)
 	continue;
       size_t entsize;
       if (plus) {
-	entsize = fuse_add_direntry_plus (req, p, rem, entry.c_str(), &e, count);
+	entsize = fuse_add_direntry_plus (req, p, rem, entry.c_str(), entry_inode->get_fuse_entry_param(), count);
 	if (entsize > rem) {
 	  abort();
 	}
       } else {
-	entsize = fuse_add_direntry(req, p, rem, entry.c_str(), &e.attr, count);
+	entsize = fuse_add_direntry(req, p, rem, entry.c_str(), entry_inode->get_attr(), count);
 	if (entsize > rem) {
 	  abort();
 	}
@@ -864,35 +1013,35 @@ struct BuildInode : public DirInode {
     fuse_reply_buf(req, ret, size);
     delete[] ret;
   }
-  BuildInode(ColdInode *cold, std::string tree) : DirInode(cold), tree(tree) {
+  BuildInode(ColdInode *cold, std::string tree)
+    : DirInode(cold), tree(tree)
+  {
     cold->set_creator(tree);
   }
 };
 
 struct BuildsInode : public DirInode {
   std::unordered_map<std::string, DirInode *> cache;
-  virtual Inode* lookup (std::string name, fuse_entry_param *e,
-			 CreateType create = CREATE_NONE)
+  virtual Inode* lookup (std::string name, mode_t *mode = nullptr)
   {
     if (cache.count (name)) {
-      e->attr.st_ino = 1;
-      e->attr.st_mode = (DT_DIR << 12) | 0770;
       return cache[name];
     }
 
     char *path;
     asprintf (&path, "build/%s", name.c_str());
     {
-      if (fstatat (cold->dir_fd, path, &e->attr, 0) >= 0) {
+      struct stat attr;
+      if (fstatat (cold->dir_fd, path, &attr, 0) >= 0) {
 	free (path);
-	return cache[name] = new BuildInode(cold, name);
+	cache[name] = new BuildInode(cold, name);
+	cache[name]->get_fuse_entry_param()->attr = attr;
+	return cache[name];
       }
     }
 
-    if (create == CREATE_DIR)
+    if (mode && S_ISDIR(*mode))
       {
-	e->attr.st_ino = 1;
-	e->attr.st_mode = (DT_DIR << 12) | 0770;
 	::mkdirat (cold->dir_fd, "build", 0770);
 	::mkdirat (cold->dir_fd, path, 0770);
 	free (path);
@@ -920,7 +1069,7 @@ struct BuildsInode : public DirInode {
       if (count++ < offset)
 	continue;
       fuse_entry_param e {};
-      Inode *entry_inode = lookup(n.first.c_str(), &e);
+      Inode *entry_inode = lookup(n.first);
       if (!entry_inode)
 	continue;
       size_t entsize;
@@ -943,15 +1092,15 @@ struct BuildsInode : public DirInode {
     delete[] ret;
   }
 
-  BuildsInode(ColdInode *cold) : DirInode(cold) {
+  BuildsInode(ColdInode *cold) : DirInode(cold)
+  {
     cold->set_creator("builds");
   }
 };
 
 struct RootInode : public DirInode {
   std::unordered_map<std::string, Inode *> cache;
-  virtual Inode* lookup (std::string name, fuse_entry_param *e,
-			 CreateType create = CREATE_NONE)
+  virtual Inode* lookup (std::string name, mode_t *mode = nullptr)
   {
     if (cache.count(name)) {
       return cache[name];
@@ -959,14 +1108,7 @@ struct RootInode : public DirInode {
     if (name == "hot") {
       return cache[name] = new HotDirInode(cold);
     }
-    if (name == "meta") {
-      e->attr.st_ino = 1;
-      e->attr.st_mode = (DT_DIR << 12) | 0770;
-      return cache[name] = new MetaInode(cold);
-    }
     if (name == "build") {
-      e->attr.st_ino = 1;
-      e->attr.st_mode = (DT_DIR << 12) | 0770;
       return cache[name] = new BuildsInode(cold);
     }
 
@@ -983,25 +1125,27 @@ struct RootInode : public DirInode {
     Inode& inode = *this;
 
     std::string entries[] = {
-      "hot", "meta", "build",
+      "hot", "build",
     };
 
     off_t count = 0;
-    for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++) {
+    for (std::string entry : entries) {
       if (count++ < offset)
 	continue;
-      fuse_entry_param e {};
-      Inode *entry_inode = lookup(entries[i], &e);
+      Inode *entry_inode = lookup(entry);
       if (!entry_inode)
 	continue;
       size_t entsize;
       if (plus) {
-	entsize = fuse_add_direntry_plus (req, p, rem, entries[i].c_str(), &e, count);
+	entsize = fuse_add_direntry_plus (req, p, rem, entry.c_str(),
+					  entry_inode->get_fuse_entry_param(),
+					  count);
 	if (entsize > rem) {
 	  abort();
 	}
       } else {
-	entsize = fuse_add_direntry(req, p, rem, entries[i].c_str(), &e.attr, count);
+	entsize = fuse_add_direntry(req, p, rem, entry.c_str(),
+				    entry_inode->get_attr(), count);
 	if (entsize > rem) {
 	  abort();
 	}
@@ -1017,26 +1161,12 @@ struct RootInode : public DirInode {
     fuse_reply_buf(req, ret, size);
     delete[] ret;
   }
-  RootInode(ColdInode *cold) : DirInode(cold) {
+
+  RootInode(ColdInode *cold) : DirInode(cold)
+  {
     cold->set_creator("hot");
   }
 };
-
-struct Fs {
-  // Must be acquired *after* any Inode.m locks.
-  std::mutex mutex;
-  std::unordered_map<std::string, int> making;
-  RootInode *root;
-  double timeout;
-  bool debug;
-  std::string source;
-  size_t blocksize;
-  dev_t src_dev;
-  bool nosplice;
-  bool nocache;
-};
-static Fs fs{};
-
 
 #define FUSE_BUF_COPY_FLAGS			\
   (fs.nosplice ?				\
@@ -1045,21 +1175,18 @@ static Fs fs{};
 
 
 static Inode& get_inode(fuse_ino_t ino) {
-  if (ino == FUSE_ROOT_ID)
+  if (ino == 1)
     return *fs.root;
-
   Inode* inode = reinterpret_cast<Inode*>(ino);
   return *inode;
 }
 
 static DirInode& get_dir_inode(fuse_ino_t ino) {
-  if (ino == FUSE_ROOT_ID)
+  if (ino == 1)
     return *fs.root;
-
   DirInode* inode = dynamic_cast<DirInode*>(reinterpret_cast<Inode*>(ino));
   return *inode;
 }
-
 
 static void sfs_init(void *userdata, fuse_conn_info *conn) {
   (void)userdata;
@@ -1079,142 +1206,6 @@ static void sfs_init(void *userdata, fuse_conn_info *conn) {
     conn->want |= FUSE_CAP_SPLICE_WRITE;
   if (conn->capable & FUSE_CAP_SPLICE_READ && !fs.nosplice)
     conn->want |= FUSE_CAP_SPLICE_READ;
-}
-
-
-static void sfs_getattr(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi) {
-  (void)fi;
-  Inode& inode = get_inode(ino);
-  struct stat attr;
-  auto res = fstatat(inode.cold->get_content_fd (), "", &attr,
-		     AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
-  if (res == -1) {
-    fuse_reply_err(req, errno);
-    return;
-  }
-  fuse_reply_attr(req, &attr, fs.timeout);
-}
-
-
-static void do_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
-		       int valid, struct fuse_file_info* fi) {
-  Inode& inode = get_inode(ino);
-  int ifd = inode.get_content_fd();
-  int res;
-
-  if (valid & FUSE_SET_ATTR_MODE) {
-    res = fchmod(ifd, attr->st_mode);
-    if (res == -1)
-      goto out_err;
-  }
-  if (valid & (FUSE_SET_ATTR_UID | FUSE_SET_ATTR_GID)) {
-    uid_t uid = (valid & FUSE_SET_ATTR_UID) ? attr->st_uid : static_cast<uid_t>(-1);
-    gid_t gid = (valid & FUSE_SET_ATTR_GID) ? attr->st_gid : static_cast<gid_t>(-1);
-
-    res = fchownat(ifd, "", uid, gid, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
-    if (res == -1)
-      goto out_err;
-  }
-  if (valid & FUSE_SET_ATTR_SIZE) {
-    res = ftruncate(ifd, attr->st_size);
-    if (res == -1)
-      goto out_err;
-  }
-  if (valid & (FUSE_SET_ATTR_ATIME | FUSE_SET_ATTR_MTIME)) {
-    struct timespec tv[2];
-
-    tv[0].tv_sec = 0;
-    tv[1].tv_sec = 0;
-    tv[0].tv_nsec = UTIME_OMIT;
-    tv[1].tv_nsec = UTIME_OMIT;
-
-    if (valid & FUSE_SET_ATTR_ATIME_NOW)
-      tv[0].tv_nsec = UTIME_NOW;
-    else if (valid & FUSE_SET_ATTR_ATIME)
-      tv[0] = attr->st_atim;
-
-    if (valid & FUSE_SET_ATTR_MTIME_NOW)
-      tv[1].tv_nsec = UTIME_NOW;
-    else if (valid & FUSE_SET_ATTR_MTIME)
-      tv[1] = attr->st_mtim;
-
-    res = futimens(ifd, tv);
-    if (res == -1)
-      goto out_err;
-  }
-  return Inode::fuse_getattr(req, ino, fi);
-
- out_err:
-  fuse_reply_err(req, errno);
-}
-
-
-static void sfs_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
-			int valid, fuse_file_info *fi) {
-  do_setattr(req, ino, attr, valid, fi);
-}
-
-static int do_lookup(fuse_ino_t parent, std::string name,
-		     fuse_entry_param *e, CreateType create = CREATE_NONE) {
-  char *fullpath;
-  asprintf (&fullpath, "%s/%s", get_inode(parent).toplevelpath ? : ".", name.c_str());
-  if (fs.debug)
-    cerr << "DEBUG: lookup(): name=" << name
-	 << ", parent=" << parent << endl;
-  memset(e, 0, sizeof(*e));
-  e->attr_timeout = fs.timeout;
-  e->entry_timeout = fs.timeout;
-
-  DirInode& parent_inode = get_dir_inode (parent);
-  Inode* inode_p = nullptr;
-  if (!parent_inode.cold)
-    abort();
-  Inode* ret_inode = parent_inode.lookup(name, e, create);
-  if (ret_inode) {
-    inode_p = ret_inode;
-    unique_lock<mutex> fs_lock {fs.mutex};
-    e->ino = reinterpret_cast<fuse_ino_t>(inode_p);
-    Inode& inode {*inode_p};
-
-    /* This is just here to make Helgrind happy. It violates the
-       lock ordering requirement (inode.m must be acquired before
-       fs.mutex), but this is of no consequence because at this
-       point no other thread has access to the inode mutex */
-    lock_guard<mutex> g {inode.m};
-    inode.src_ino = e->attr.st_ino;
-    inode.src_dev = e->attr.st_dev;
-    inode.nlookup++;
-    inode.cold = ret_inode->cold;
-    inode.toplevelpath = fullpath;
-    fs_lock.unlock();
-
-    if (fs.debug)
-      cerr << "DEBUG: lookup(): created userspace inode " << e->attr.st_ino
-	   << endl;
-    return 0;
-  }
-
-  return errno;
-}
-
-
-static void sfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name) {
-  fuse_entry_param e {};
-  auto err = do_lookup(parent, name, &e);
-  if (err == ENOENT) {
-    e.attr_timeout = fs.timeout;
-    e.entry_timeout = fs.timeout;
-    e.ino = e.attr.st_ino = 0;
-    fuse_reply_entry(req, &e);
-  } else if (err) {
-    if (err == ENFILE || err == EMFILE)
-      cerr << "ERROR: Reached maximum number of file descriptors." << endl;
-    fuse_reply_err(req, err);
-  } else {
-    e.attr.st_ino = e.ino;
-    errno = 0;
-    fuse_reply_entry(req, &e);
-  }
 }
 
 
@@ -1772,7 +1763,7 @@ static void assign_operations(fuse_lowlevel_ops &sfs_oper) {
   sfs_oper.forget = sfs_forget;
   sfs_oper.forget_multi = sfs_forget_multi;
   sfs_oper.getattr = Inode::fuse_getattr;
-  sfs_oper.setattr = sfs_setattr;
+  sfs_oper.setattr = Inode::fuse_setattr;
   sfs_oper.readlink = sfs_readlink;
   sfs_oper.opendir = sfs_opendir;
   sfs_oper.readdir = sfs_readdir;

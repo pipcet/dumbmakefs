@@ -121,7 +121,6 @@ public:
 void BuildManager::send(std::string msg)
 {
   write(pipe[1], msg.c_str(), msg.length() + 1);
-  write(pipe[1], "\n", 2);
 }
 
 void BuildManager::wait(std::string tree)
@@ -610,6 +609,11 @@ struct Inode {
     get_fuse_entry_param()->attr.st_ino = get_ino();
     get_fuse_entry_param()->attr.st_mode = (DT_DIR << 12) | 0770;
   }
+  Inode(ColdInode *cold, bool create = false)
+    : Inode()
+  {
+    this->cold = cold;
+  }
   Inode(const Inode&) = delete;
   Inode(Inode&& inode) = delete;
   Inode& operator=(Inode&& inode) = delete;
@@ -651,7 +655,7 @@ struct DirInode : public Inode {
     return false;
   }
 
-  virtual Inode* file_inode(int, std::string, bool = false)
+  virtual Inode* file_inode(ColdInode *, bool = false)
   {
     while (true);
   }
@@ -674,10 +678,10 @@ struct DirInode : public Inode {
       ::close (::openat (cold->get_content_fd(), path, O_CREAT|O_RDWR, 0660));
       res = fstatat(cold->get_content_fd (), path, &e->attr,
 		    AT_SYMLINK_NOFOLLOW);
-      Inode* ret = file_inode(cold->get_content_fd(), name, true);
+      Inode* ret = file_inode(new ColdInode(cold->get_content_fd(), name),
+			      true);
       ret->get_fuse_entry_param()->ino = reinterpret_cast<fuse_ino_t>(ret);
       ret->cold->set_creator (get_tree());
-      e->attr.st_mode = ret->mode(e->attr.st_mode);
       ret->entry_param = ep;
       return ret;
     } else if (mode && S_ISDIR(*mode) && res < 0) {
@@ -691,7 +695,6 @@ struct DirInode : public Inode {
 		    AT_SYMLINK_NOFOLLOW);
       Inode* ret = dir_inode(new ColdDirInode(cold->get_content_fd(), name.c_str()));
       ret->get_fuse_entry_param()->ino = reinterpret_cast<fuse_ino_t>(ret);
-      e->attr.st_mode = ret->mode(e->attr.st_mode);
       ret->entry_param = ep;
       return ret;
     }
@@ -708,13 +711,11 @@ struct DirInode : public Inode {
     if (S_ISDIR (e->attr.st_mode)) {
       Inode* ret = dir_inode(new ColdDirInode (cold->get_content_fd(), name));
       ret->get_fuse_entry_param()->ino = reinterpret_cast<fuse_ino_t>(ret);
-      e->attr.st_mode = ret->mode(e->attr.st_mode);
       ret->entry_param = ep;
       return ret;
     } else {
-      Inode* ret = file_inode(cold->get_content_fd(), name);
+      Inode* ret = file_inode(new ColdInode (cold->get_content_fd(), name));
       ret->get_fuse_entry_param()->ino = reinterpret_cast<fuse_ino_t>(ret);
-      e->attr.st_mode = ret->mode(e->attr.st_mode);
       ret->entry_param = ep;
       return ret;
     }
@@ -777,7 +778,12 @@ struct DirInode : public Inode {
   }
 };
 
-struct HotInode : public Inode {};
+struct HotInode : public Inode {
+  HotInode(ColdInode *cold, bool create = false)
+    : Inode(cold, create)
+  {
+  }
+};
 struct HotDirInode : public DirInode {
   virtual Inode* lookup(std::string name, mode_t *mode = nullptr)
   {
@@ -811,10 +817,9 @@ struct HotDirInode : public DirInode {
     return false;
   }
 
-  virtual Inode* file_inode(int fd, std::string name, bool = false)
+  virtual Inode* file_inode(ColdInode *cold, bool = false)
   {
-    Inode* ret = new HotInode();
-    ret->cold = new ColdInode (fd, name);
+    Inode* ret = new HotInode(cold);
     ret->cold->make_visible("hot");
     return ret;
   }

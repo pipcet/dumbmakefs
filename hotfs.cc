@@ -954,13 +954,9 @@ struct RootInode : public DirInode {
 			 CreateType create = CREATE_NONE)
   {
     if (cache.count(name)) {
-      e->attr.st_ino = 1;
-      e->attr.st_mode = (DT_DIR << 12) | 0770;
       return cache[name];
     }
     if (name == "hot") {
-      e->attr.st_ino = 1;
-      e->attr.st_mode = (DT_DIR << 12) | 0770;
       return cache[name] = new HotDirInode(cold);
     }
     if (name == "meta") {
@@ -1107,13 +1103,7 @@ static void do_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
   int res;
 
   if (valid & FUSE_SET_ATTR_MODE) {
-    if (fi) {
-      res = fchmod(fi->fh, attr->st_mode);
-    } else {
-      char procname[64];
-      sprintf(procname, "/proc/self/fd/%i", ifd);
-      res = chmod(procname, attr->st_mode);
-    }
+    res = fchmod(ifd, attr->st_mode);
     if (res == -1)
       goto out_err;
   }
@@ -1126,13 +1116,7 @@ static void do_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
       goto out_err;
   }
   if (valid & FUSE_SET_ATTR_SIZE) {
-    if (fi) {
-      res = ftruncate(fi->fh, attr->st_size);
-    } else {
-      char procname[64];
-      sprintf(procname, "/proc/self/fd/%i", ifd);
-      res = truncate(procname, attr->st_size);
-    }
+    res = ftruncate(ifd, attr->st_size);
     if (res == -1)
       goto out_err;
   }
@@ -1154,17 +1138,11 @@ static void do_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
     else if (valid & FUSE_SET_ATTR_MTIME)
       tv[1] = attr->st_mtim;
 
-    if (fi)
-      res = futimens(fi->fh, tv);
-    else {
-      char procname[64];
-      sprintf(procname, "/proc/self/fd/%i", ifd);
-      res = utimensat(AT_FDCWD, procname, tv, 0);
-    }
+    res = futimens(ifd, tv);
     if (res == -1)
       goto out_err;
   }
-  return sfs_getattr(req, ino, fi);
+  return Inode::fuse_getattr(req, ino, fi);
 
  out_err:
   fuse_reply_err(req, errno);
@@ -1173,7 +1151,6 @@ static void do_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
 
 static void sfs_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
 			int valid, fuse_file_info *fi) {
-  (void) ino;
   do_setattr(req, ino, attr, valid, fi);
 }
 
@@ -1246,31 +1223,25 @@ static void mknod_symlink(fuse_req_t req, fuse_ino_t parent,
 			  const char *link) {
   int res;
   DirInode& inode_p = get_dir_inode(parent);
-  auto saverr = ENOMEM;
-  fuse_entry_param e {};
   if (S_ISDIR(mode)) {
-    e.ino = reinterpret_cast<fuse_ino_t>(inode_p.lookup(name, &e, CREATE_DIR));
-    fuse_reply_entry (req, &e);
+    Inode* inode = inode_p.lookup(name, &mode);
+    inode->get_fuse_entry_param()->ino =
+      reinterpret_cast<fuse_ino_t>(inode);
+    fuse_reply_entry (req, inode->get_fuse_entry_param());
     return;
   } else if (S_ISLNK(mode))
     res = symlinkat(link, inode_p.get_content_fd(), name);
   else
     res = mknodat(inode_p.get_content_fd(), name, mode, rdev);
-  saverr = errno;
-  if (res == -1)
-    goto out;
 
-  saverr = do_lookup(parent, name, &e);
-  if (saverr)
-    goto out;
-
-  fuse_reply_entry(req, &e);
-  return;
-
- out:
-  if (saverr == ENFILE || saverr == EMFILE)
-    cerr << "ERROR: Reached maximum number of file descriptors." << endl;
-  fuse_reply_err(req, saverr);
+  try {
+    if (res == -1)
+      throw Errno(errno);
+    Inode* inode = inode_p.lookup(name);
+    fuse_reply_entry(req, inode->get_fuse_entry_param());
+  } catch (Errno error) {
+    fuse_reply_err(req, error.error);
+  }
 }
 
 
@@ -1519,15 +1490,16 @@ static void sfs_releasedir(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi) {
 
 static void sfs_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 		       mode_t mode, fuse_file_info *fi) {
-  fuse_entry_param e;
-  auto err = do_lookup(parent, name, &e, CREATE_FILE);
-  if (err) {
-    fuse_reply_err (req, err);
-  } else {
-    fuse_reply_create (req, &e, fi);
+  Inode* inode_p = reinterpret_cast<Inode*>(parent);
+  try {
+    Inode* inode = inode_p->lookup(std::string(name), &mode);
+    fuse_reply_entry(req, inode->get_fuse_entry_param());
+  } catch (ErrorInode* error) {
+    if (error->get_error() == ENOENT)
+      fuse_reply_entry(req, error->get_fuse_entry_param());
+    else
+      fuse_reply_err(req, error->get_error());
   }
-
-  return;
 }
 
 static void sfs_fsyncdir(fuse_req_t req, fuse_ino_t, int, fuse_file_info *) {
@@ -1555,6 +1527,8 @@ static void sfs_open(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi) {
     fi->flags &= ~O_APPEND;
 
   auto fd = dup(inode.cold->get_content_fd());
+  if ((fi->flags & O_WRONLY) && (fi->flags & O_TRUNC))
+    ftruncate (fd, 0);
   if (fd == -1) {
     auto err = errno;
     if (err == ENFILE || err == EMFILE)
@@ -1577,8 +1551,8 @@ static void sfs_release(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi) {
 
 
 static void sfs_flush(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi) {
-  (void) ino;
-  auto res = close(dup(fi->fh));
+  Inode& inode = get_inode(ino);
+  auto res = close(dup(inode.get_content_fd()));
   fuse_reply_err(req, res == -1 ? errno : 0);
 }
 
@@ -1586,12 +1560,7 @@ static void sfs_flush(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi) {
 static void sfs_fsync(fuse_req_t req, fuse_ino_t ino, int datasync,
 		      fuse_file_info *fi) {
   (void) ino;
-  int res;
-  if (datasync)
-    res = fdatasync(fi->fh);
-  else
-    res = fsync(fi->fh);
-  fuse_reply_err(req, res == -1 ? errno : 0);
+  fuse_reply_err(req, 0);
 }
 
 
@@ -1792,8 +1761,8 @@ static void sfs_removexattr(fuse_req_t req, fuse_ino_t ino, const char *name) {
 
 static void assign_operations(fuse_lowlevel_ops &sfs_oper) {
   sfs_oper.init = sfs_init;
-  sfs_oper.lookup = sfs_lookup;
-  sfs_oper.mkdir = sfs_mkdir;
+  sfs_oper.lookup = Inode::fuse_lookup;
+  sfs_oper.mkdir = Inode::fuse_mkdir;
   sfs_oper.mknod = sfs_mknod;
   sfs_oper.symlink = sfs_symlink;
   sfs_oper.link = sfs_link;
@@ -1802,7 +1771,7 @@ static void assign_operations(fuse_lowlevel_ops &sfs_oper) {
   sfs_oper.rename = sfs_rename;
   sfs_oper.forget = sfs_forget;
   sfs_oper.forget_multi = sfs_forget_multi;
-  sfs_oper.getattr = sfs_getattr;
+  sfs_oper.getattr = Inode::fuse_getattr;
   sfs_oper.setattr = sfs_setattr;
   sfs_oper.readlink = sfs_readlink;
   sfs_oper.opendir = sfs_opendir;
@@ -1962,8 +1931,4 @@ int main(int argc, char *argv[]) {
   fuse_opt_free_args(&args);
 
   return ret ? 1 : 0;
-}
-static NewDirInode *build_newdir(std::string tree)
-{
-  return new NewDirInode(fs.root->cold, tree, "hot");
 }

@@ -249,14 +249,6 @@ struct Hot {
   }
 
   static void fuse_getattr(fuse_req_t req, fuse_ino_t ino, fuse_file_info*);
-  static void fuse_readdirplus(fuse_req_t req, fuse_ino_t ino, size_t size,
-			       off_t notreallyanoffset, fuse_file_info*);
-  static void fuse_lookup(fuse_req_t req, fuse_ino_t parent, const char *name);
-  static void fuse_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name,
-			 mode_t mode);
-  static void fuse_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name);
-  static void fuse_create(fuse_req_t req, fuse_ino_t parent, const char *name,
-			  mode_t mode, fuse_file_info*);
   static void fuse_open(fuse_req_t req, fuse_ino_t parent, fuse_file_info*);
   static void fuse_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
 			fuse_file_info*);
@@ -271,6 +263,14 @@ struct Hot {
 };
 
 struct CoolDir : public Hot {
+  static void fuse_readdirplus(fuse_req_t req, fuse_ino_t ino, size_t size,
+			       off_t notreallyanoffset, fuse_file_info*);
+  static void fuse_lookup(fuse_req_t req, fuse_ino_t parent, const char *name);
+  static void fuse_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name,
+			 mode_t mode);
+  static void fuse_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name);
+  static void fuse_create(fuse_req_t req, fuse_ino_t parent, const char *name,
+			  mode_t mode, fuse_file_info*);
   virtual bool not_found(std::string, mode_t*)
   {
     return false;
@@ -562,9 +562,9 @@ CoolDir& CoolDir::from_inode(fuse_ino_t ino)
     return *hot_root;
   }
   Hot* hot = reinterpret_cast<Hot*>(ino);
-  HotDir* hotdir = dynamic_cast<HotDir*>(hot);
-  if (hotdir)
-    return *hotdir;
+  CoolDir* dir = dynamic_cast<CoolDir*>(hot);
+  if (dir)
+    return *dir;
   throw Errno(ENOTDIR);
 }
 
@@ -579,7 +579,7 @@ void Hot::fuse_getattr(fuse_req_t req, fuse_ino_t ino, fuse_file_info*)
   }
 }
 
-void Hot::fuse_readdirplus(fuse_req_t req, fuse_ino_t ino, size_t size,
+void CoolDir::fuse_readdirplus(fuse_req_t req, fuse_ino_t ino, size_t size,
 		       off_t notreallyanoffset, fuse_file_info*)
 {
   try {
@@ -592,7 +592,7 @@ void Hot::fuse_readdirplus(fuse_req_t req, fuse_ino_t ino, size_t size,
   }
 }
 
-void Hot::fuse_lookup(fuse_req_t req, fuse_ino_t ino, const char *string)
+void CoolDir::fuse_lookup(fuse_req_t req, fuse_ino_t ino, const char *string)
 {
   std::string name(string);
   try {
@@ -606,7 +606,7 @@ void Hot::fuse_lookup(fuse_req_t req, fuse_ino_t ino, const char *string)
   }
 }
 
-void Hot::fuse_mkdir(fuse_req_t req, fuse_ino_t ino, const char *string,
+void CoolDir::fuse_mkdir(fuse_req_t req, fuse_ino_t ino, const char *string,
 		       mode_t mode)
 {
   std::string name(string);
@@ -621,7 +621,7 @@ void Hot::fuse_mkdir(fuse_req_t req, fuse_ino_t ino, const char *string,
     fuse_reply_err(req, error.error);
   }
 }
-void Hot::fuse_rmdir(fuse_req_t req, fuse_ino_t ino, const char *string)
+void CoolDir::fuse_rmdir(fuse_req_t req, fuse_ino_t ino, const char *string)
 {
   std::string name(string);
   try {
@@ -637,7 +637,7 @@ void Hot::fuse_rmdir(fuse_req_t req, fuse_ino_t ino, const char *string)
     fuse_reply_err(req, error.error);
   }
 }
-void Hot::fuse_create(fuse_req_t req, fuse_ino_t ino, const char *string,
+void CoolDir::fuse_create(fuse_req_t req, fuse_ino_t ino, const char *string,
 		      mode_t mode, fuse_file_info* fi)
 {
   std::string name(string);
@@ -697,15 +697,15 @@ void Hot::fuse_write_buf(fuse_req_t req, fuse_ino_t ino, fuse_bufvec *in_buf,
 }
 
 static fuse_lowlevel_ops fuse_operations = {
-  .lookup = Hot::fuse_lookup,
+  .lookup = CoolDir::fuse_lookup,
   .getattr = Hot::fuse_getattr,
-  .mkdir = Hot::fuse_mkdir,
-  .rmdir = Hot::fuse_rmdir,
+  .mkdir = CoolDir::fuse_mkdir,
+  .rmdir = CoolDir::fuse_rmdir,
   .open = Hot::fuse_open,
   .read = Hot::fuse_read,
-  .create = Hot::fuse_create,
+  .create = CoolDir::fuse_create,
   .write_buf = Hot::fuse_write_buf,
-  .readdirplus = Hot::fuse_readdirplus,
+  .readdirplus = CoolDir::fuse_readdirplus,
 };
 
 int main(int argc, char **argv)

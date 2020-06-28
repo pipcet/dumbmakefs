@@ -7,9 +7,9 @@ sub make_visible {
 	chomp $file;
 	my $path = $file;
 	$path =~ s/^\.\///;
-	$path =~ s/\//\/content\//g;
+	$path =~ s/\//\/versions\/hot\/content\//g;
 	warn "new file $file";
-	system("> cold/content/${path}/visible/hot")
+	symlink($tree, "cold/versions/hot/content/${path}/versions/hot");
     }
 }
 

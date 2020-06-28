@@ -119,11 +119,43 @@ struct Errno {
 };
 
 mode_t dir_mode = (DT_DIR << 12) | 0770;
+mode_t file_mode = 0660;
+
+void fs_delete_recursively_at(int fd, std::string path)
+{
+  if (::unlinkat(fd, path.c_str(), 0) == 0)
+    return;
+
+  int dirfd;
+  DIR *dir = fdopendir (dirfd = ::openat (fd, path.c_str(), O_DIRECTORY));
+  struct dirent *dirent;
+  while ((dirent = readdir(dir))) {
+    std::string name(dirent->d_name);
+    if (name == "." || name == "..")
+      continue;
+    fs_delete_recursively_at (dirfd, name);
+  }
+  closedir (dir);
+  ::unlinkat(fd, path.c_str(), AT_REMOVEDIR);
+}
 
 struct Cold {
   int dir_fd;
 
   Cold(int dir_fd) : dir_fd(dir_fd) {}
+
+  bool is_dir(std::string version)
+  {
+    struct stat stat;
+    fstatat(dir_fd, ("versions/" + version + "/content").c_str(), &stat,
+	    AT_SYMLINK_NOFOLLOW);
+    return S_ISDIR(stat.st_mode);
+  }
+
+  void delete_version(std::string version)
+  {
+    fs_delete_recursively_at(dir_fd, "versions/" + version);
+  }
 
   int get_versions_fd()
   {
@@ -151,7 +183,7 @@ struct Cold {
     fuse_entry_param ep {};
     if (::fstatat(get_version_fd(version),
 		  "content", &ep.attr, AT_SYMLINK_NOFOLLOW) < 0)
-      throw Errno();
+      ep = fuse_entry_param {};
     return ep;
   }
 };
@@ -181,6 +213,32 @@ struct Hot {
     return &ep;
   }
 
+  virtual void delete_version()
+  {
+    cold->delete_version(version);
+  }
+
+  int get_version_fd()
+  {
+    return cold->get_version_fd(version);
+  }
+
+  int get_versioned_fd(std::string name, mode_t *create = nullptr)
+  {
+    int version_fd = get_version_fd();
+    int fd = ::openat(version_fd, name.c_str(), O_DIRECTORY);
+    if (fd < 0 && create) {
+      ::mkdirat(version_fd, name.c_str(), *create);
+      return get_versioned_fd(name, create);
+    }
+    return fd;
+  }
+
+  virtual int get_content_fd()
+  {
+    return get_versioned_fd("content", &file_mode);
+  }
+
   static void fuse_getattr(fuse_req_t req, fuse_ino_t ino, fuse_file_info*);
   static void fuse_readdirplus(fuse_req_t req, fuse_ino_t ino, size_t size,
 			       off_t notreallyanoffset, fuse_file_info*);
@@ -204,25 +262,21 @@ struct Hot {
 };
 
 struct HotDir : public Hot {
-  int get_versioned_fd(std::string name, mode_t *create = nullptr)
-  {
-    int version_fd = get_version_fd();
-    int fd = ::openat(version_fd, name.c_str(), O_DIRECTORY);
-    if (fd < 0 && create) {
-      ::mkdirat(version_fd, name.c_str(), *create);
-      return get_versioned_fd(name, create);
-    }
-    return fd;
-  }
-
-  int get_version_fd()
-  {
-    return cold->get_version_fd(version);
-  }
-
   int get_readdir_fd()
   {
     return get_versioned_fd("content", &dir_mode);
+  }
+
+  virtual Cold* new_cold(int fd)
+  {
+    return new Cold(fd);
+  }
+
+  virtual Hot* new_hot(Cold* cold, std::string version)
+  {
+    if (cold->is_dir(version))
+      return new HotDir(cold, version);
+    return new Hot(cold, version);
   }
 
   virtual Hot* lookup(std::string name, mode_t *create = nullptr)
@@ -239,6 +293,8 @@ struct HotDir : public Hot {
 	::close(::openat(content_fd, (name + "/versions/" + version + "/content").c_str(), O_CREAT, *create));
       } else if (S_ISDIR(*create)) {
 	::mkdirat(content_fd, (name + "/versions/" + version + "/content").c_str(), *create);
+      } else {
+	throw Errno(EINVAL);
       }
       return lookup(name, create);
     }
@@ -246,7 +302,7 @@ struct HotDir : public Hot {
     if (fd < 0)
       return nullptr;
 
-    return new Hot(new Cold(fd), version);
+    return new_hot(new_cold(fd), version);
   }
 
   virtual void readdirplus(fuse_req_t req, char *buf, size_t *size, off_t offset)
@@ -435,9 +491,35 @@ void Hot::fuse_lookup(fuse_req_t req, fuse_ino_t ino, const char *string)
 
 void Hot::fuse_mkdir(fuse_req_t req, fuse_ino_t ino, const char *string,
 		       mode_t mode)
-{}
+{
+  std::string name(string);
+  try {
+    HotDir& dir = HotDir::from_inode(ino);
+    mode |= (DT_DIR << 12);
+    Hot* hot = dir.lookup(name, &mode);
+    if (!hot)
+      throw Errno();
+    fuse_reply_entry(req, hot->get_fuse_entry_param());
+  } catch (Errno error) {
+    fuse_reply_err(req, error.error);
+  }
+}
 void Hot::fuse_rmdir(fuse_req_t req, fuse_ino_t ino, const char *string)
-{}
+{
+  std::string name(string);
+  try {
+    HotDir& dir = HotDir::from_inode(ino);
+    Hot* hot = dir.lookup(name);
+    if (!hot) {
+      fuse_reply_err(req, 0);
+      return;
+    }
+    hot->delete_version();
+    fuse_reply_err(req, 0);
+  } catch (Errno error) {
+    fuse_reply_err(req, error.error);
+  }
+}
 void Hot::fuse_create(fuse_req_t req, fuse_ino_t ino, const char *string,
 		      mode_t mode, fuse_file_info* fi)
 {
@@ -452,9 +534,31 @@ void Hot::fuse_create(fuse_req_t req, fuse_ino_t ino, const char *string,
     fuse_reply_err(req, error.error);
   }
 }
-void Hot::fuse_open(fuse_req_t req, fuse_ino_t parent, fuse_file_info*){}
+
+void Hot::fuse_open(fuse_req_t req, fuse_ino_t ino, fuse_file_info* fi)
+{
+  try {
+    Hot& hot = Hot::from_inode(ino);
+    (void)hot;
+    fuse_reply_open(req, fi);
+  } catch (Errno error) {
+    fuse_reply_err(req, error.error);
+  }
+}
 void Hot::fuse_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
-		      fuse_file_info*){}
+		    fuse_file_info*)
+{
+  try {
+    Hot& hot = Hot::from_inode(ino);
+    fuse_bufvec buf = FUSE_BUFVEC_INIT(size);
+    buf.buf[0].flags = static_cast<fuse_buf_flags>(FUSE_BUF_IS_FD|FUSE_BUF_FD_SEEK);
+    buf.buf[0].fd = hot.get_content_fd();
+    buf.buf[0].pos = off;
+    fuse_reply_data(req, &buf, fuse_buf_copy_flags());
+  } catch (Errno error) {
+    fuse_reply_err(req, error.error);
+  }
+}
 void Hot::fuse_write_buf(fuse_req_t req, fuse_ino_t ino, fuse_bufvec *,
 			   off_t, fuse_file_info*){}
 

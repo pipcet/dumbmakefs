@@ -185,7 +185,16 @@ struct Hot {
   static void fuse_readdirplus(fuse_req_t req, fuse_ino_t ino, size_t size,
 			       off_t notreallyanoffset, fuse_file_info*);
   static void fuse_lookup(fuse_req_t req, fuse_ino_t parent, const char *name);
-
+  static void fuse_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name,
+			 mode_t mode);
+  static void fuse_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name);
+  static void fuse_create(fuse_req_t req, fuse_ino_t parent, const char *name,
+			  mode_t mode, fuse_file_info*);
+  static void fuse_open(fuse_req_t req, fuse_ino_t parent, fuse_file_info*);
+  static void fuse_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
+			fuse_file_info*);
+  static void fuse_write_buf(fuse_req_t req, fuse_ino_t ino, fuse_bufvec *,
+			     off_t, fuse_file_info*);
   static Hot& from_inode(fuse_ino_t ino);
   Hot(Cold *cold, std::string version)
     : cold(cold), version(version)
@@ -221,9 +230,16 @@ struct HotDir : public Hot {
     int content_fd = get_readdir_fd();
     if (content_fd < 0)
       return nullptr;
-    int fd = ::openat(content_fd, name.c_str(), O_RDWR);
+    int fd = ::openat(content_fd, name.c_str(), O_DIRECTORY);
     if (fd < 0 && create) {
       ::mkdirat(content_fd, name.c_str(), dir_mode);
+      ::mkdirat(content_fd, (name + "/versions").c_str(), dir_mode);
+      ::mkdirat(content_fd, (name + "/versions/" + version).c_str(), dir_mode);
+      if (S_ISREG(*create)) {
+	::close(::openat(content_fd, (name + "/versions/" + version + "/content").c_str(), O_CREAT, *create));
+      } else if (S_ISDIR(*create)) {
+	::mkdirat(content_fd, (name + "/versions/" + version + "/content").c_str(), *create);
+      }
       return lookup(name, create);
     }
 
@@ -250,8 +266,8 @@ struct HotDir : public Hot {
       Hot* entry = lookup(name);
       if (!entry)
 	continue;
-      size_t entsize = fuse_add_direntry(req, p, rem, name.c_str(),
-					 entry->getattr(), count);
+      size_t entsize = fuse_add_direntry_plus(req, p, rem, name.c_str(),
+					      entry->get_fuse_entry_param(), count);
       if (entsize > rem)
 	break;
       p += entsize;
@@ -417,10 +433,40 @@ void Hot::fuse_lookup(fuse_req_t req, fuse_ino_t ino, const char *string)
   }
 }
 
+void Hot::fuse_mkdir(fuse_req_t req, fuse_ino_t ino, const char *string,
+		       mode_t mode)
+{}
+void Hot::fuse_rmdir(fuse_req_t req, fuse_ino_t ino, const char *string)
+{}
+void Hot::fuse_create(fuse_req_t req, fuse_ino_t ino, const char *string,
+		      mode_t mode, fuse_file_info* fi)
+{
+  std::string name(string);
+  try {
+    HotDir& dir = HotDir::from_inode(ino);
+    Hot* hot = dir.lookup(name, &mode);
+    if (!hot)
+      throw Errno();
+    fuse_reply_create(req, hot->get_fuse_entry_param(), fi);
+  } catch (Errno error) {
+    fuse_reply_err(req, error.error);
+  }
+}
+void Hot::fuse_open(fuse_req_t req, fuse_ino_t parent, fuse_file_info*){}
+void Hot::fuse_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
+		      fuse_file_info*){}
+void Hot::fuse_write_buf(fuse_req_t req, fuse_ino_t ino, fuse_bufvec *,
+			   off_t, fuse_file_info*){}
+
 static fuse_lowlevel_ops fuse_operations = {
   .lookup = Hot::fuse_lookup,
   .getattr = Hot::fuse_getattr,
-  //.readdir = Hot::fuse_readdir,
+  .mkdir = Hot::fuse_mkdir,
+  .rmdir = Hot::fuse_rmdir,
+  .open = Hot::fuse_open,
+  .read = Hot::fuse_read,
+  .create = Hot::fuse_create,
+  .write_buf = Hot::fuse_write_buf,
   .readdirplus = Hot::fuse_readdirplus,
 };
 

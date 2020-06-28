@@ -1316,7 +1316,7 @@ static void delete_recursively (int fd, const char *name)
   if (::unlinkat(fd, name, 0) == 0)
     return;
   int dirfd;
-  DIR *dir = fdopendir (dirfd = openat (fd, name, O_DIRECTORY));
+  DIR *dir = fdopendir (dirfd = ::openat (fd, name, O_DIRECTORY));
   struct dirent *dirent;
   while ((dirent = readdir(dir))) {
     if (is_dot_or_dotdot (dirent->d_name))
@@ -1423,7 +1423,7 @@ static void sfs_opendir(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi) {
   // access d until we've called fuse_reply_*.
   lock_guard<mutex> g {inode.m};
 
-  auto fd = openat(inode.get_content_fd(), ".", O_RDONLY);
+  auto fd = ::openat(inode.get_content_fd(), ".", O_RDONLY);
   if (fd == -1)
     goto out_errno;
 

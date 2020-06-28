@@ -226,7 +226,10 @@ struct Hot {
   int get_versioned_fd(std::string name, mode_t *create = nullptr)
   {
     int version_fd = get_version_fd();
-    int fd = ::openat(version_fd, name.c_str(), O_DIRECTORY);
+    int fd = ::openat(version_fd, name.c_str(), O_RDWR);
+    if (fd >= 0)
+      return fd;
+    fd = ::openat(version_fd, name.c_str(), O_DIRECTORY);
     if (fd < 0 && create) {
       ::mkdirat(version_fd, name.c_str(), *create);
       return get_versioned_fd(name, create);
@@ -236,7 +239,7 @@ struct Hot {
 
   virtual int get_content_fd()
   {
-    return get_versioned_fd("content", &file_mode);
+    return get_versioned_fd("content", &dir_mode);
   }
 
   static void fuse_getattr(fuse_req_t req, fuse_ino_t ino, fuse_file_info*);
@@ -559,8 +562,25 @@ void Hot::fuse_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
     fuse_reply_err(req, error.error);
   }
 }
-void Hot::fuse_write_buf(fuse_req_t req, fuse_ino_t ino, fuse_bufvec *,
-			   off_t, fuse_file_info*){}
+void Hot::fuse_write_buf(fuse_req_t req, fuse_ino_t ino, fuse_bufvec *in_buf,
+			 off_t off, fuse_file_info*)
+{
+  try {
+    Hot& hot = Hot::from_inode(ino);
+    // if (!hot.modify())
+    size_t size = fuse_buf_size(in_buf);
+    fuse_bufvec buf = FUSE_BUFVEC_INIT(size);
+    buf.buf[0].flags = static_cast<fuse_buf_flags>(FUSE_BUF_IS_FD|FUSE_BUF_FD_SEEK);
+    buf.buf[0].fd = hot.get_content_fd();
+    buf.buf[0].pos = off;
+    ssize_t res = fuse_buf_copy(&buf, in_buf, fuse_buf_copy_flags());
+    if (res < 0)
+      throw Errno(-res);
+    fuse_reply_write(req, res);
+  } catch (Errno error) {
+    fuse_reply_err(req, error.error);
+  }
+}
 
 static fuse_lowlevel_ops fuse_operations = {
   .lookup = Hot::fuse_lookup,

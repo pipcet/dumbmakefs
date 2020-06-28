@@ -29,6 +29,7 @@ sub cancel_build {
 $/ = "\0";
 while (<>) {
     chomp;
+    warn $_;
     if (/^start (\d+) (.*)$/) {
 	my $tree = ${1};
 	my $file = ${2};

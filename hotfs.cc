@@ -860,7 +860,7 @@ struct WorkDirInode : public DirInode {
   {
     Inode* ret = new WorkInode(cold, tree, parent_tree);
     ret->cold->make_visible(tree);
-    if (!is_new)
+    if (!is_new && ret->cold->get_creator() != tree)
       ret->cold->make_rdep(tree);
     return ret;
   }
@@ -1478,14 +1478,13 @@ static void sfs_create(fuse_req_t req, fuse_ino_t parent, const char *name,
   try {
     Inode* inode = inode_p->lookup(std::string(name), &mode);
     if (!inode)
-      fuse_reply_entry(req, inode->empty_entry_param());
-    else
-      fuse_reply_entry(req, inode->get_fuse_entry_param());
+      fuse_reply_err(req, EIO);
+    else {
+      fi->fh = inode->cold->dir_fd;
+      fuse_reply_create(req, inode->get_fuse_entry_param(), fi);
+    }
   } catch (ErrorInode* error) {
-    if (error->get_error() == ENOENT)
-      fuse_reply_entry(req, error->get_fuse_entry_param());
-    else
-      fuse_reply_err(req, error->get_error());
+    fuse_reply_err(req, error->get_error());
   }
 }
 

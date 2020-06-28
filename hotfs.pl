@@ -33,7 +33,7 @@ while (<>) {
     if (/^start (\d+) (.*)$/) {
 	my $tree = ${1};
 	my $file = ${2};
-	system("mkdir hot/build/${tree}") and die;
+	system("mkdir hot/build/${tree}");
 	my $pid = fork();
 	if ($pid == 0) {
 	    chdir("hot/build/${tree}/work");

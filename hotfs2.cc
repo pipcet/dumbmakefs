@@ -41,7 +41,7 @@ private:
   std::unordered_multimap<std::string,std::string> version_to_files {};
 public:
   void send(std::string msg);
-  void wait(std::string version);
+  bool wait(std::string version);
   std::string build(std::string file) {
     if (file_to_version.count(file) &&
 	finished.count(file_to_version[file]))
@@ -83,7 +83,7 @@ void BuildManager::send(std::string msg)
   write(pipe[1], msg.c_str(), msg.length() + 1);
 }
 
-void BuildManager::wait(std::string version)
+bool BuildManager::wait(std::string version)
 {
   std::string str = "";
   while (!finished.count(version)) {
@@ -98,6 +98,7 @@ void BuildManager::wait(std::string version)
       str = "";
     }
   }
+  return version != "";
 }
 
 static BuildManager bm;
@@ -107,9 +108,9 @@ static void cancel_build(std::string version)
   bm.cancel(version);
 }
 
-static void build_file(std::string file)
+static bool build_file(std::string file)
 {
-  bm.wait(bm.build(file));
+  return bm.wait(bm.build(file));
 }
 
 struct Errno {
@@ -172,11 +173,11 @@ struct Cold {
     symlinkat(from.c_str(), get_versions_fd(), version.c_str());
   }
 
-  int get_version_fd(std::string version)
+  int get_version_fd(std::string version, mode_t* create = nullptr)
   {
     int versions_fd = get_versions_fd();
     int fd = ::openat(versions_fd, version.c_str(), 0);
-    if (fd < 0) {
+    if (fd < 0 && create) {
       ::mkdirat(versions_fd, version.c_str(), dir_mode);
       return get_version_fd(version);
     }
@@ -194,7 +195,7 @@ struct Cold {
 };
 
 struct Hot {
-  Cold *cold;
+  Cold* cold;
   std::string version;
 
   fuse_entry_param ep {};
@@ -269,7 +270,7 @@ struct Hot {
   virtual ~Hot() {}
 };
 
-struct HotDir : public Hot {
+struct CoolDir : public Hot {
   virtual bool not_found(std::string, mode_t*)
   {
     return false;
@@ -288,7 +289,7 @@ struct HotDir : public Hot {
   virtual Hot* new_hot(Cold* cold, std::string version)
   {
     if (cold->is_dir(version))
-      return new HotDir(cold, version);
+      return new CoolDir(cold, version);
     return new Hot(cold, version);
   }
 
@@ -349,14 +350,51 @@ struct HotDir : public Hot {
     *size = p - buf;
   }
 
-  static HotDir& from_inode(fuse_ino_t ino);
+  static CoolDir& from_inode(fuse_ino_t ino);
 
-  HotDir(Cold *cold, std::string version)
+  CoolDir(Cold *cold, std::string version)
     : Hot(cold, version)
   {}
 };
 
-struct HotDirNonbacked : public HotDir {
+struct WarmDir : public CoolDir {
+  virtual Hot* new_hot(Cold* cold, std::string version)
+  {
+    if (cold->is_dir(version))
+      return new WarmDir(cold, version);
+    return new Hot(cold, version);
+  }
+
+  WarmDir(Cold* cold, std::string version)
+    : CoolDir(cold, version)
+  {
+  }
+};
+
+struct HotDir : public WarmDir {
+  virtual Hot* new_hot(Cold* cold, std::string version)
+  {
+    if (cold->is_dir(version))
+      return new HotDir(cold, version);
+    return new Hot(cold, version);
+  }
+
+  virtual bool not_found(std::string file, mode_t*)
+  {
+    if (version == "hot") {
+      std::cerr << "not found: " << file << std::endl;
+      return build_file(file);
+    }
+    return false;
+  }
+
+  HotDir(Cold* cold, std::string version)
+    : WarmDir(cold, version)
+  {
+  }
+};
+
+struct VirtualDir : public CoolDir {
   virtual std::vector<std::string> names()
   {
     return std::vector<std::string>();
@@ -385,24 +423,60 @@ struct HotDirNonbacked : public HotDir {
     *size = p - buf;
   }
 
-  HotDirNonbacked(Cold *cold, std::string version = "hot")
-    : HotDir(cold, version)
+  VirtualDir(Cold *cold, std::string version = "hot")
+    : CoolDir(cold, version)
   {}
 };
 
 struct HotNew : public HotDir {
+  virtual bool not_found(std::string file, mode_t*)
+  {
+    return false;
+  }
+
   HotNew(Cold* cold, std::string version)
     : HotDir(cold, version)
   {}
 };
 
 struct HotDeps : public HotDir {
+  virtual bool not_found(std::string file, mode_t*)
+  {
+    return false;
+  }
+
   HotDeps(Cold* cold, std::string version)
     : HotDir(cold, version)
   {}
 };
 
-struct HotBuild : public HotDirNonbacked {
+struct HotLazyDir : public HotDir {
+  std::string fallback;
+  virtual bool not_found(std::string file, mode_t*)
+  {
+    HotDir hotdir(cold, "hot");
+    Hot* hot = hotdir.lookup(file);
+    if (hot) {
+      cold->create_version(version, "hot");
+      return true;
+    }
+    return false;
+  }
+
+  HotLazyDir(Cold* cold, std::string version, std::string fallback)
+    : HotDir(cold, version), fallback(fallback)
+  {
+  }
+};
+
+struct BuildDir : public VirtualDir {
+  std::string fallback;
+
+  virtual bool not_found(std::string file, mode_t*)
+  {
+    return false;
+  }
+
   virtual std::vector<std::string> names()
   {
     return std::vector<std::string> { "work", "new", "deps" };
@@ -411,7 +485,7 @@ struct HotBuild : public HotDirNonbacked {
   virtual Hot* lookup(std::string name, mode_t *create = nullptr)
   {
     if (name == "work") {
-      return new HotDir(cold, version);
+      return new HotLazyDir(cold, version, fallback);
     }
     if (name == "new") {
       return new HotNew(cold, version);
@@ -422,14 +496,14 @@ struct HotBuild : public HotDirNonbacked {
     return nullptr;
   }
 
-  HotBuild(Cold* cold, std::string version)
-    : HotDirNonbacked(cold, version)
+  BuildDir(Cold* cold, std::string version, std::string fallback)
+    : VirtualDir(cold, version), fallback(fallback)
   {
-    this->version = version;
   }
 };
 
-struct HotBuilds : public HotDirNonbacked {
+struct BuildsDir : public VirtualDir {
+  std::string fallback;
   virtual std::vector<std::string> names()
   {
     return std::vector<std::string> { "hot" };
@@ -437,39 +511,42 @@ struct HotBuilds : public HotDirNonbacked {
 
   virtual Hot* lookup(std::string name, mode_t *create = nullptr)
   {
-    cold->create_version(name, "hot");
-    return new HotBuild(cold, name);
+    cold->create_version(name, fallback);
+    return new BuildDir(cold, name, fallback);
   }
 
-  HotBuilds(Cold *cold)
-    : HotDirNonbacked(cold)
+  BuildsDir(Cold *cold, std::string fallback)
+    : VirtualDir(cold), fallback(fallback)
   {
   }
 };
 
-struct HotRoot : public HotDirNonbacked {
+struct RootDir : public VirtualDir {
   virtual std::vector<std::string> names()
   {
-    return std::vector<std::string> { "hot", "build" };
+    return std::vector<std::string> { "hot", "warm", "cool", "build" };
   }
 
   virtual Hot* lookup(std::string name, mode_t *create = nullptr)
   {
-    if (name == "hot") {
+    if (name == "hot")
       return new HotDir(cold, "hot");
-    }
-    if (name == "build") {
-      return new HotBuilds(cold);
-    }
+    if (name == "warm")
+      return new WarmDir(cold, "hot");
+    if (name == "cool")
+      return new CoolDir(cold, "hot");
+    if (name == "build")
+      return new BuildsDir(cold, "hot");
+
     return nullptr;
   }
 
-  HotRoot(Cold *cold)
-    : HotDirNonbacked(cold)
+  RootDir(Cold *cold)
+    : VirtualDir(cold)
   {}
 };
 
-static HotRoot *hot_root;
+static RootDir *hot_root;
 
 Hot& Hot::from_inode(fuse_ino_t ino)
 {
@@ -479,7 +556,7 @@ Hot& Hot::from_inode(fuse_ino_t ino)
   return *reinterpret_cast<Hot*>(ino);
 }
 
-HotDir& HotDir::from_inode(fuse_ino_t ino)
+CoolDir& CoolDir::from_inode(fuse_ino_t ino)
 {
   if (ino == 1) {
     return *hot_root;
@@ -506,7 +583,7 @@ void Hot::fuse_readdirplus(fuse_req_t req, fuse_ino_t ino, size_t size,
 		       off_t notreallyanoffset, fuse_file_info*)
 {
   try {
-    HotDir& hot = HotDir::from_inode(ino);
+    CoolDir& hot = CoolDir::from_inode(ino);
     char buf[size];
     hot.readdirplus(req, buf, &size, notreallyanoffset);
     fuse_reply_buf(req, buf, size);
@@ -519,7 +596,7 @@ void Hot::fuse_lookup(fuse_req_t req, fuse_ino_t ino, const char *string)
 {
   std::string name(string);
   try {
-    HotDir& dir = HotDir::from_inode(ino);
+    CoolDir& dir = CoolDir::from_inode(ino);
     Hot* hot = dir.lookup(name);
     if (!hot)
       throw Errno();
@@ -534,7 +611,7 @@ void Hot::fuse_mkdir(fuse_req_t req, fuse_ino_t ino, const char *string,
 {
   std::string name(string);
   try {
-    HotDir& dir = HotDir::from_inode(ino);
+    CoolDir& dir = CoolDir::from_inode(ino);
     mode |= (DT_DIR << 12);
     Hot* hot = dir.lookup(name, &mode);
     if (!hot)
@@ -548,7 +625,7 @@ void Hot::fuse_rmdir(fuse_req_t req, fuse_ino_t ino, const char *string)
 {
   std::string name(string);
   try {
-    HotDir& dir = HotDir::from_inode(ino);
+    CoolDir& dir = CoolDir::from_inode(ino);
     Hot* hot = dir.lookup(name);
     if (!hot) {
       fuse_reply_err(req, 0);
@@ -565,7 +642,7 @@ void Hot::fuse_create(fuse_req_t req, fuse_ino_t ino, const char *string,
 {
   std::string name(string);
   try {
-    HotDir& dir = HotDir::from_inode(ino);
+    CoolDir& dir = CoolDir::from_inode(ino);
     Hot* hot = dir.lookup(name, &mode);
     if (!hot)
       throw Errno();
@@ -637,7 +714,7 @@ int main(int argc, char **argv)
   ::mkdirat(cold_fd, "versions", dir_mode);
   ::mkdirat(cold_fd, "versions/hot", dir_mode);
   ::mkdirat(cold_fd, "versions/hot/content", dir_mode);
-  hot_root = new HotRoot(new Cold(cold_fd));
+  hot_root = new RootDir(new Cold(cold_fd));
   fuse_args args = FUSE_ARGS_INIT(0, nullptr);
   if (fuse_opt_add_arg(&args, argv[0]))
     abort();
@@ -659,7 +736,10 @@ int main(int argc, char **argv)
   if (fuse_session_mount(session, argv[2]))
     abort();
 
-  int ret = fuse_session_loop(session);
+  struct fuse_loop_config loop_config;
+  loop_config.clone_fd = 0;
+  loop_config.max_idle_threads = 10;
+  int ret = fuse_session_loop_mt(session, &loop_config);
 
   fuse_session_unmount(session);
 

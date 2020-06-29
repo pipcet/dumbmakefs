@@ -32,86 +32,8 @@
 #include <mutex>
 #include <thread>
 
-class BuildManager {
-private:
-  long build_count = time(nullptr);
-  int pipe[4];
-  std::unordered_map<std::string,bool> finished {};
-  std::unordered_map<std::string,std::string> file_to_version {};
-  std::unordered_multimap<std::string,std::string> version_to_files {};
-public:
-  void send(std::string msg);
-  bool wait(std::string version);
-  std::string build(std::string file) {
-    if (file_to_version.count(file) &&
-	finished.count(file_to_version[file]))
-      return "";
-    char *str;
-    asprintf(&str, "%ld", build_count++);
-    std::string version(str);
-    send("start " + version + " " + file);
-    file_to_version[file] = version;
-    version_to_files.insert({version,file});
-    return version;
-  }
-  void cancel(std::string version) {
-    send("cancel " + version);
-    auto range = version_to_files.equal_range(version);
-    for_each(range.first, range.second, [this](auto &x) {
-      file_to_version.erase(x.second);
-    });
-    version_to_files.erase(version);
-  }
-
-  BuildManager() {
-    if (::pipe(pipe))
-      abort();
-    if (::pipe(pipe+2))
-      abort();
-    if (::fork() == 0) {
-      dup2(pipe[0], 0);
-      dup2(pipe[3], 1);
-      execl("hotfs.pl", "hotfs.pl", NULL);
-      exit(1);
-    }
-    finished[""] = true;
-  }
-};
-
-void BuildManager::send(std::string msg)
-{
-  write(pipe[1], msg.c_str(), msg.length() + 1);
-}
-
-bool BuildManager::wait(std::string version)
-{
-  std::string str = "";
-  while (!finished.count(version)) {
-    char c;
-    ssize_t res = read(pipe[2], &c, 1);
-    if (res <= 0)
-      break;
-    if (c)
-      str += c;
-    else {
-      finished[str] = true;
-      str = "";
-    }
-  }
-  return version != "";
-}
-
-static BuildManager bm;
-
-static void cancel_build(std::string version)
-{
-  bm.cancel(version);
-}
-
-static bool build_file(std::string file)
-{
-  return bm.wait(bm.build(file));
-}
+static void cancel_build(std::string version);
+static bool build_file(std::string file);
 
 struct Errno {
   int error;
@@ -146,14 +68,25 @@ struct Cold {
 
   Cold(int dir_fd) : dir_fd(dir_fd) {}
 
+  std::string get_link(std::string version)
+  {
+    struct stat attr;
+    if (::fstatat(get_versions_fd(), version.c_str(), &attr, AT_SYMLINK_NOFOLLOW) < 0)
+      throw Errno();
+    char buf[attr.st_size+1];
+    ::readlinkat(get_versions_fd(), version.c_str(), buf, sizeof buf);
+    buf[attr.st_size] = 0;
+    return std::string(buf);
+  }
+
   void split_link(std::string version)
   {
     struct stat attr;
     if (::fstatat(get_versions_fd(), version.c_str(), &attr, AT_SYMLINK_NOFOLLOW) < 0)
       return;
-    char buf[attr.st_size];
+    char buf[attr.st_size+1];
     ::readlinkat(get_versions_fd(), version.c_str(), buf, sizeof buf);
-    std::string old_version(buf);
+    buf[attr.st_size] = 0;
 
     ::unlinkat(get_versions_fd(), version.c_str(), 0);
     ::mkdirat(get_versions_fd(), version.c_str(), dir_mode);
@@ -416,7 +349,7 @@ struct CoolDir : public Hot {
     return false;
   }
 
-  int get_readdir_fd()
+  virtual int get_readdir_fd()
   {
     return get_versioned_fd("content", &dir_mode);
   }
@@ -640,6 +573,31 @@ struct NewsDir : public HotDir {
   }
 };
 
+struct UsedDir : public HotDir {
+  virtual Hot* new_hot(std::string name, Cold* cold, std::string version)
+  {
+    if (cold->is_dir(version))
+      return new UsedDir(path + "/" + name, cold, version);
+    return new Hot(path + "/" + name, cold, version);
+  }
+
+  virtual bool visible(Cold* cold)
+  {
+    return (cold->visible(version) && !cold->is_link(version) &&
+	    cold->is_link("hot") && cold->get_link("hot") == version);
+  }
+
+  virtual bool not_found(std::string file, mode_t*, Cold*)
+  {
+    return false;
+  }
+
+  UsedDir(std::string path, Cold* cold, std::string version)
+    : HotDir(path, cold, version)
+  {
+  }
+};
+
 struct DepsDir : public HotDir {
   virtual Hot* new_hot(std::string name, Cold* cold, std::string version)
   {
@@ -700,7 +658,7 @@ struct BuildDir : public VirtualDir {
 
   virtual std::vector<std::string> names()
   {
-    return std::vector<std::string> { "work", "news", "deps" };
+    return std::vector<std::string> { "work", "news", "deps", "used" };
   }
 
   virtual Hot* lookup(std::string name, mode_t *create = nullptr)
@@ -710,6 +668,9 @@ struct BuildDir : public VirtualDir {
     }
     if (name == "news") {
       return new NewsDir(path + "/" + name, cold, version);
+    }
+    if (name == "used") {
+      return new UsedDir(path + "/" + name, cold, version);
     }
     if (name == "deps") {
       return new DepsDir(path + "/" + name, cold, version);
@@ -723,11 +684,17 @@ struct BuildDir : public VirtualDir {
   }
 };
 
-struct BuildsDir : public VirtualDir {
+struct BuildsDir : public CoolDir {
   std::string fallback;
   virtual std::vector<std::string> names()
   {
     return std::vector<std::string> { fallback };
+  }
+
+  virtual int get_readdir_fd()
+  {
+    ::mkdirat(cold->dir_fd, "builds", dir_mode);
+    return ::openat(cold->dir_fd, "builds", 0);
   }
 
   virtual Hot* lookup(std::string name, mode_t *create = nullptr)
@@ -737,7 +704,7 @@ struct BuildsDir : public VirtualDir {
   }
 
   BuildsDir(std::string path, Cold *cold, std::string fallback)
-    : VirtualDir(path, cold), fallback(fallback)
+    : CoolDir(path, cold, "hot"), fallback(fallback)
   {
   }
 };
@@ -764,7 +731,8 @@ struct RootDir : public VirtualDir {
 
   RootDir(Cold *cold)
     : VirtualDir("", cold)
-  {}
+  {
+  }
 };
 
 static RootDir *hot_root;
@@ -1016,3 +984,87 @@ int main(int argc, char **argv)
 
   return ret;
 }
+
+class BuildManager {
+private:
+  long build_count = time(nullptr);
+  int pipe[4];
+  std::unordered_map<std::string,bool> finished {};
+  std::unordered_map<std::string,std::string> file_to_version {};
+  std::unordered_multimap<std::string,std::string> version_to_files {};
+public:
+  void send(std::string msg);
+  bool wait(std::string version);
+  std::string build(std::string file) {
+    if (file_to_version.count(file) &&
+	finished.count(file_to_version[file]))
+      return "";
+    char *str;
+    asprintf(&str, "%ld", build_count++);
+    std::string version(str);
+    ::mkdirat(hot_root->cold->dir_fd, "builds", dir_mode);
+    ::mkdirat(hot_root->cold->dir_fd, ("builds/" + version).c_str(), dir_mode);
+    send("start " + version + " " + file);
+    file_to_version[file] = version;
+    version_to_files.insert({version,file});
+    return version;
+  }
+  void cancel(std::string version) {
+    send("cancel " + version);
+    auto range = version_to_files.equal_range(version);
+    for_each(range.first, range.second, [this](auto &x) {
+      file_to_version.erase(x.second);
+    });
+    version_to_files.erase(version);
+  }
+
+  BuildManager() {
+    if (::pipe(pipe))
+      abort();
+    if (::pipe(pipe+2))
+      abort();
+    if (::fork() == 0) {
+      dup2(pipe[0], 0);
+      dup2(pipe[3], 1);
+      execl("hotfs.pl", "hotfs.pl", NULL);
+      exit(1);
+    }
+    finished[""] = true;
+  }
+};
+
+void BuildManager::send(std::string msg)
+{
+  write(pipe[1], msg.c_str(), msg.length() + 1);
+}
+
+bool BuildManager::wait(std::string version)
+{
+  std::string str = "";
+  while (!finished.count(version)) {
+    char c;
+    ssize_t res = read(pipe[2], &c, 1);
+    if (res <= 0)
+      break;
+    if (c)
+      str += c;
+    else {
+      finished[str] = true;
+      str = "";
+    }
+  }
+  return version != "";
+}
+
+static BuildManager bm;
+
+static void cancel_build(std::string version)
+{
+  bm.cancel(version);
+}
+
+static bool build_file(std::string file)
+{
+  return bm.wait(bm.build(file));
+}
+

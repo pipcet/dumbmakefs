@@ -1,21 +1,41 @@
 #!/usr/bin/perl
 
+sub garbage_collect {
+    my ($tree) = @_;
+    my $version = $tree;
+    my @files = (`cd hot/build/${tree}/news; find -type f -print0`);
+    for my $file (@files) {
+	chomp $file;
+	my $path = $file;
+	$path =~ s/^\.\///;
+	$path =~ s/\//\/versions\/hot\/content\//g;
+	my $used = 0;
+	if (readlink("cold/versions/hot/content/${path}/versions/hot") eq
+	    $tree) {
+	    warn "using file $file from version $version";
+	    $used++;
+	}
+	warn "$used files used from version $version";
+    }
+}
+
 sub make_visible {
     my ($tree) = @_;
-    my @files = (`cd hot/build/${tree}/new; find -type f -print0`);
+    my @files = (`cd hot/build/${tree}/news; find -type f -print0`);
     for my $file (@files) {
 	chomp $file;
 	my $path = $file;
 	$path =~ s/^\.\///;
 	$path =~ s/\//\/versions\/hot\/content\//g;
 	warn "new file $file";
+	rmdir("cold/versions/hot/content/${path}/versions/hot");
 	symlink($tree, "cold/versions/hot/content/${path}/versions/hot");
     }
 }
 
 sub cancel_build {
     my ($tree) = @_;
-    my @files = (`cd hot/build/${tree}/new; find -type f -print0`);
+    my @files = (`cd hot/build/${tree}/news; find -type f -print0`);
     for my $file (@files) {
 	chomp $file;
 	my $path = $file;
@@ -40,6 +60,7 @@ while (<>) {
     warn $_;
     if (/^start (\d+) (.*)$/) {
 	my $tree = ${1};
+	$trees{$tree} = 1;
 	my $file = ${2};
 	system("mkdir hot/build/${tree}");
 	my $pid = fork();
@@ -54,6 +75,9 @@ while (<>) {
 	}
 	$| = 1;
 	print "${tree}\0";
+	for my $tree (keys %trees) {
+	    garbage_collect($tree);
+	}
     } elsif (/^cancel (\d+)/) {
 	cancel_build $1;
     }

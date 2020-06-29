@@ -63,6 +63,7 @@ void fs_delete_recursively_at(int fd, std::string path)
 }
 
 struct Cold {
+  int refcount = 0;
   int dir_fd;
   int versions_fd {-1};
 
@@ -309,6 +310,7 @@ struct Hot {
   Hot(std::string path, Cold *cold, std::string version)
     : path(path), cold(cold), version(version)
   {
+    cold->refcount++;
     if(by_path.count(path) > 0)
       std::cerr << "duplicate path " << path << std::endl;
     by_path[path] = this;
@@ -325,6 +327,8 @@ struct Hot {
   }
   virtual ~Hot()
   {
+    if (cold->refcount-- == 1)
+      delete cold;
     if (content_fd >= 0)
       ::close(content_fd);
     if (content_writable_fd >= 0)
@@ -359,10 +363,17 @@ struct CoolDir : public Hot {
     return new Cold(fd);
   }
 
+  virtual Hot* new_hot_dir(std::string path, Cold* cold, std::string version)
+  {
+    return new CoolDir(path, cold, version);
+  }
+
   virtual Hot* new_hot(std::string path, Cold* cold, std::string version)
   {
+    if (by_path.count(path))
+      return by_path[path];
     if (cold->is_dir(version))
-      return new CoolDir(path, cold, version);
+      return new_hot_dir(path, cold, version);
     return new Hot(path, cold, version);
   }
 
@@ -427,9 +438,11 @@ struct CoolDir : public Hot {
 	goto again;
       }
     }
-    if (!cold->is_nonexistent(version) && visible(cold)) {
-      return new_hot(path + "/" + name, cold, version);
-    } else {
+    if (cold->is_nonexistent(version)) {
+      delete cold;
+      return nullptr;
+    }
+    if (!visible(cold)) {
       if (not_found(name, create, cold)) {
 	delete cold;
 	goto again;
@@ -438,6 +451,7 @@ struct CoolDir : public Hot {
 	return nullptr;
       }
     }
+    return new_hot(path + "/" + name, cold, version);
   }
 
   virtual void readdirplus(fuse_req_t req, char *buf, size_t *size, off_t offset)
@@ -477,11 +491,9 @@ struct CoolDir : public Hot {
 };
 
 struct WarmDir : public CoolDir {
-  virtual Hot* new_hot(std::string name, Cold* cold, std::string version)
+  virtual Hot* new_hot_dir(std::string name, Cold* cold, std::string version)
   {
-    if (cold->is_dir(version))
-      return new WarmDir(path + "/" + name, cold, version);
-    return new Hot(path + "/" + name, cold, version);
+    return new WarmDir(path + "/" + name, cold, version);
   }
 
   WarmDir(std::string path, Cold* cold, std::string version)
@@ -491,17 +503,14 @@ struct WarmDir : public CoolDir {
 };
 
 struct HotDir : public WarmDir {
-  virtual Hot* new_hot(std::string name, Cold* cold, std::string version)
+  virtual Hot* new_hot_dir(std::string name, Cold* cold, std::string version)
   {
-    if (cold->is_dir(version))
-      return new HotDir(path + "/" + name, cold, version);
-    return new Hot(path + "/" + name, cold, version);
+    return new HotDir(path + "/" + name, cold, version);
   }
 
   virtual bool not_found(std::string file, mode_t*, Cold*)
   {
     if (version == "hot") {
-      std::cerr << "not found: " << file << std::endl;
       return build_file(file);
     }
     return false;
@@ -549,11 +558,9 @@ struct VirtualDir : public CoolDir {
 };
 
 struct NewsDir : public HotDir {
-  virtual Hot* new_hot(std::string name, Cold* cold, std::string version)
+  virtual Hot* new_hot_dir(std::string name, Cold* cold, std::string version)
   {
-    if (cold->is_dir(version))
-      return new NewsDir(path + "/" + name, cold, version);
-    return new Hot(path + "/" + name, cold, version);
+    return new NewsDir(path + "/" + name, cold, version);
   }
 
   virtual bool visible(Cold* cold)
@@ -574,11 +581,9 @@ struct NewsDir : public HotDir {
 };
 
 struct UsedDir : public HotDir {
-  virtual Hot* new_hot(std::string name, Cold* cold, std::string version)
+  virtual Hot* new_hot_dir(std::string name, Cold* cold, std::string version)
   {
-    if (cold->is_dir(version))
-      return new UsedDir(path + "/" + name, cold, version);
-    return new Hot(path + "/" + name, cold, version);
+    return new UsedDir(path + "/" + name, cold, version);
   }
 
   virtual bool visible(Cold* cold)
@@ -599,11 +604,9 @@ struct UsedDir : public HotDir {
 };
 
 struct DepsDir : public HotDir {
-  virtual Hot* new_hot(std::string name, Cold* cold, std::string version)
+  virtual Hot* new_hot_dir(std::string name, Cold* cold, std::string version)
   {
-    if (cold->is_dir(version))
-      return new DepsDir(path + "/" + name, cold, version);
-    return new Hot(path + "/" + name, cold, version);
+    return new DepsDir(path + "/" + name, cold, version);
   }
 
   virtual bool visible(Cold* cold)
@@ -664,16 +667,24 @@ struct BuildDir : public VirtualDir {
   virtual Hot* lookup(std::string name, mode_t *create = nullptr)
   {
     if (name == "work") {
-      return new OverlayDir(path + "/" + name, cold, version, fallback);
+      std::string fullpath = path + "/" + name;
+      return (by_path.count(fullpath) ? by_path[fullpath] :
+	      new OverlayDir(path + "/" + name, cold, version, fallback));
     }
     if (name == "news") {
-      return new NewsDir(path + "/" + name, cold, version);
+      std::string fullpath = path + "/" + name;
+      return (by_path.count(fullpath) ? by_path[fullpath] :
+	      new NewsDir(path + "/" + name, cold, version));
     }
     if (name == "used") {
-      return new UsedDir(path + "/" + name, cold, version);
+      std::string fullpath = path + "/" + name;
+      return (by_path.count(fullpath) ? by_path[fullpath] :
+	      new UsedDir(path + "/" + name, cold, version));
     }
     if (name == "deps") {
-      return new DepsDir(path + "/" + name, cold, version);
+      std::string fullpath = path + "/" + name;
+      return (by_path.count(fullpath) ? by_path[fullpath] :
+	      new DepsDir(path + "/" + name, cold, version));
     }
     return nullptr;
   }
@@ -700,7 +711,9 @@ struct BuildsDir : public CoolDir {
   virtual Hot* lookup(std::string name, mode_t *create = nullptr)
   {
     cold->create_version(name, fallback);
-    return new BuildDir(path + "/" + name, cold, name, fallback);
+    std::string fullpath = path + "/" + name;
+    return (by_path.count(fullpath) ? by_path[fullpath] :
+	    new BuildDir(path + "/" + name, cold, name, fallback));
   }
 
   BuildsDir(std::string path, Cold *cold, std::string fallback)
@@ -958,8 +971,8 @@ int main(int argc, char **argv)
     abort();
   if (fuse_opt_add_arg(&args, "default_permissions,fsname=hotfs"))
     abort();
-  if (fuse_opt_add_arg(&args, "-odebug"))
-    abort();
+  //if (fuse_opt_add_arg(&args, "-odebug"))
+  //  abort();
   auto session =
     fuse_session_new(&args, &fuse_operations, sizeof(fuse_operations), nullptr);
   if (!session)

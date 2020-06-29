@@ -22,7 +22,15 @@ sub cancel_build {
 	$path =~ s/^\.\///;
 	$path =~ s/\//\/content\//g;
 	warn "deleting file $file";
-	system("rm -rf cold/content/${path}")
+	system("rm -rf cold/content/${path}/versions/hot")
+    }
+}
+
+sub analysis {
+    my @files = (`cd cold; find -type f -print0`);
+    for my $file (@files) {
+	chomp $file;
+	my @comps = split "/content/", $file;
     }
 }
 

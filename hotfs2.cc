@@ -184,6 +184,11 @@ struct Cold {
     return fd;
   }
 
+  bool visible(std::string version)
+  {
+    return get_version_fd(version) >= 0;
+  }
+
   fuse_entry_param getattr(std::string version)
   {
     fuse_entry_param ep {};
@@ -197,6 +202,7 @@ struct Cold {
 struct Hot {
   Cold* cold;
   std::string version;
+  bool readonly = false;
 
   fuse_entry_param ep {};
 
@@ -207,15 +213,11 @@ struct Hot {
 
   struct stat* getattr()
   {
-    ep = cold->getattr(version);
-    ep.ino = reinterpret_cast<fuse_ino_t>(this);
     return &ep.attr;
   }
 
   fuse_entry_param* get_fuse_entry_param()
   {
-    ep = cold->getattr(version);
-    ep.ino = reinterpret_cast<fuse_ino_t>(this);
     return &ep;
   }
 
@@ -258,6 +260,16 @@ struct Hot {
   Hot(Cold *cold, std::string version)
     : cold(cold), version(version)
   {
+    ep = cold->getattr(version);
+    ep.ino = reinterpret_cast<fuse_ino_t>(this);
+    ep.attr.st_ino = ep.ino;
+    struct stat attr;
+    fstatat(cold->dir_fd, ("versions/" + version).c_str(),
+	    &attr, AT_SYMLINK_NOFOLLOW);
+    readonly = S_ISLNK(attr.st_mode);
+    if (readonly) {
+      //ep.attr.st_mode &= ~0222;
+    }
   }
   virtual ~Hot() {}
 };
@@ -271,6 +283,7 @@ struct CoolDir : public Hot {
   static void fuse_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name);
   static void fuse_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 			  mode_t mode, fuse_file_info*);
+
   virtual bool not_found(std::string, mode_t*)
   {
     return false;
@@ -320,7 +333,13 @@ struct CoolDir : public Hot {
       return nullptr;
     }
 
-    return new_hot(new_cold(fd), version);
+    Cold* cold = new_cold(fd);
+    if (cold->visible(version))
+      return new_hot(cold, version);
+    delete cold;
+    if (not_found(name, create))
+      goto again;
+    return nullptr;
   }
 
   virtual void readdirplus(fuse_req_t req, char *buf, size_t *size, off_t offset)
@@ -425,46 +444,49 @@ struct VirtualDir : public CoolDir {
 
   VirtualDir(Cold *cold, std::string version = "hot")
     : CoolDir(cold, version)
-  {}
+  {
+  }
 };
 
-struct HotNew : public HotDir {
+struct NewsDir : public HotDir {
   virtual bool not_found(std::string file, mode_t*)
   {
     return false;
   }
 
-  HotNew(Cold* cold, std::string version)
+  NewsDir(Cold* cold, std::string version)
     : HotDir(cold, version)
-  {}
+  {
+  }
 };
 
-struct HotDeps : public HotDir {
+struct DepsDir : public HotDir {
   virtual bool not_found(std::string file, mode_t*)
   {
     return false;
   }
 
-  HotDeps(Cold* cold, std::string version)
+  DepsDir(Cold* cold, std::string version)
     : HotDir(cold, version)
-  {}
+  {
+  }
 };
 
-struct HotLazyDir : public HotDir {
+struct OverlayDir : public CoolDir {
   std::string fallback;
   virtual bool not_found(std::string file, mode_t*)
   {
-    HotDir hotdir(cold, "hot");
-    Hot* hot = hotdir.lookup(file);
+    CoolDir dir(cold, "hot");
+    Hot* hot = dir.lookup(file);
     if (hot) {
-      cold->create_version(version, "hot");
+      hot->cold->create_version(version, "hot");
       return true;
     }
     return false;
   }
 
-  HotLazyDir(Cold* cold, std::string version, std::string fallback)
-    : HotDir(cold, version), fallback(fallback)
+  OverlayDir(Cold* cold, std::string version, std::string fallback)
+    : CoolDir(cold, version), fallback(fallback)
   {
   }
 };
@@ -479,19 +501,19 @@ struct BuildDir : public VirtualDir {
 
   virtual std::vector<std::string> names()
   {
-    return std::vector<std::string> { "work", "new", "deps" };
+    return std::vector<std::string> { "work", "news", "deps" };
   }
 
   virtual Hot* lookup(std::string name, mode_t *create = nullptr)
   {
     if (name == "work") {
-      return new HotLazyDir(cold, version, fallback);
+      return new OverlayDir(cold, version, fallback);
     }
-    if (name == "new") {
-      return new HotNew(cold, version);
+    if (name == "news") {
+      return new NewsDir(cold, version);
     }
     if (name == "deps") {
-      return new HotDeps(cold, version);
+      return new DepsDir(cold, version);
     }
     return nullptr;
   }

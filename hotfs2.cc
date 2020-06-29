@@ -120,6 +120,9 @@ struct Cold {
   bool is_nonexistent(std::string version)
   {
     struct stat stat;
+    if (fstatat(dir_fd, ("versions/" + version).c_str(), &stat,
+		AT_SYMLINK_NOFOLLOW) < 0)
+      return false;
     if (fstatat(dir_fd, ("versions/" + version + "/content").c_str(), &stat,
 		AT_SYMLINK_NOFOLLOW) < 0)
       return true;
@@ -214,6 +217,7 @@ struct Cold {
 };
 struct Hot;
 static std::unordered_map<std::string,Hot*> by_path;
+
 struct Hot {
   std::string path;
   Cold* cold;
@@ -689,6 +693,8 @@ struct BuildDir : public VirtualDir {
     return nullptr;
   }
 
+  virtual void delete_version();
+
   BuildDir(std::string path, Cold* cold, std::string version, std::string fallback)
     : VirtualDir(path, cold, version), fallback(fallback)
   {
@@ -969,7 +975,7 @@ int main(int argc, char **argv)
     abort();
   if (fuse_opt_add_arg(&args, "-o"))
     abort();
-  if (fuse_opt_add_arg(&args, "default_permissions,fsname=hotfs"))
+  if (fuse_opt_add_arg(&args, "fsname=hotfs"))
     abort();
   //if (fuse_opt_add_arg(&args, "-odebug"))
   //  abort();
@@ -1081,3 +1087,9 @@ static bool build_file(std::string file)
   return bm.wait(bm.build(file));
 }
 
+void BuildDir::delete_version()
+{
+  VirtualDir::delete_version();
+  ::unlinkat(hot_root->cold->dir_fd, ("builds/" + version).c_str(),
+	     AT_REMOVEDIR);
+}

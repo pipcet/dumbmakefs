@@ -172,21 +172,35 @@ struct Cold {
     return versions_fd = fd;
   }
 
-  void create_version(std::string version, std::string from)
+  void create_version(std::string version, std::string fallback)
   {
-    symlinkat(from.c_str(), get_versions_fd(), version.c_str());
+    struct stat attr;
+    if (::fstatat(get_versions_fd(), fallback.c_str(), &attr, 0) < 0) {
+      ::mkdirat(get_versions_fd(), fallback.c_str(), dir_mode);
+    }
+    ::symlinkat(fallback.c_str(), get_versions_fd(), version.c_str());
   }
 
-  int get_version_fd(std::string version, mode_t* create = nullptr)
+  int get_version_fd(std::string version, mode_t* create = nullptr,
+		     bool require_new = false)
   {
     int versions_fd = get_versions_fd();
   again:
-    int fd = ::openat(versions_fd, version.c_str(), 0);
-    if (fd < 0 && create) {
+    int fd = ::openat(versions_fd, version.c_str(), require_new ? O_NOFOLLOW : 0);
+    if (fd < 0 && (create || require_new)) {
+      ::unlinkat(versions_fd, version.c_str(), 0);
       ::mkdirat(versions_fd, version.c_str(), dir_mode);
       goto again;
     }
     return fd;
+  }
+
+  bool is_link(std::string version)
+  {
+    struct stat attr;
+    if (fstatat(get_versions_fd(), version.c_str(), &attr, AT_SYMLINK_NOFOLLOW) < 0)
+      throw Errno();
+    return S_ISLNK(attr.st_mode);
   }
 
   bool visible(std::string version)
@@ -205,6 +219,19 @@ struct Cold {
     ::close(fd);
     return ep;
   }
+
+  void set_mode(std::string version, mode_t mode)
+  {
+    ::fchmodat(get_version_fd(version), "content", mode, 0);
+  }
+
+  void set_mtime(std::string version, struct timespec time)
+  {
+    struct timespec tv[2];
+    tv[0] = getattr(version).attr.st_atim;
+    tv[1] = time;
+    ::utimensat(get_version_fd(version), "content", tv, 0);
+  }
 };
 struct Hot;
 static std::unordered_map<std::string,Hot*> by_path;
@@ -214,6 +241,7 @@ struct Hot {
   std::string version;
   bool readonly = false;
   int content_fd {-1};
+  int content_writable_fd {-1};
 
   fuse_entry_param ep {};
 
@@ -232,19 +260,30 @@ struct Hot {
     return &ep;
   }
 
+  void set_mode(mode_t mode)
+  {
+    cold->set_mode(version, mode);
+  }
+
+  void set_mtime(struct timespec tv = { 0, UTIME_NOW })
+  {
+    cold->set_mtime(version, tv);
+  }
+
   virtual void delete_version()
   {
     cold->delete_version(version);
   }
 
-  int get_version_fd()
+  int get_version_fd(bool require_new = false)
   {
-    return cold->get_version_fd(version);
+    return cold->get_version_fd(version, nullptr, require_new);
   }
 
-  int get_versioned_fd(std::string name, mode_t *create = nullptr)
+  int get_versioned_fd(std::string name, mode_t *create = nullptr,
+		       bool require_new = false)
   {
-    int version_fd = get_version_fd();
+    int version_fd = get_version_fd(require_new);
   again:
     int fd = ::openat(version_fd, name.c_str(), O_RDWR);
     if (fd >= 0) {
@@ -267,7 +306,22 @@ struct Hot {
     return content_fd = get_versioned_fd("content", &dir_mode);
   }
 
+  virtual int get_writable_fd()
+  {
+    if (content_writable_fd >= 0)
+      return content_writable_fd;
+    return content_writable_fd = content_fd =
+      get_versioned_fd("content", &dir_mode, true);
+  }
+
+  virtual bool is_nonexistent()
+  {
+    return get_content_fd() < 0;
+  }
+
   static void fuse_getattr(fuse_req_t req, fuse_ino_t ino, fuse_file_info*);
+  static void fuse_setattr(fuse_req_t req, fuse_ino_t ino, struct stat* attr,
+			   int valid, fuse_file_info* fi);
   static void fuse_open(fuse_req_t req, fuse_ino_t parent, fuse_file_info*);
   static void fuse_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
 			fuse_file_info*);
@@ -291,7 +345,10 @@ struct Hot {
       //ep.attr.st_mode &= ~0222;
     }
   }
-  virtual ~Hot() {}
+  virtual ~Hot()
+  {
+    by_path.erase(path);
+  }
 };
 
 struct CoolDir : public Hot {
@@ -304,7 +361,7 @@ struct CoolDir : public Hot {
   static void fuse_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 			  mode_t mode, fuse_file_info*);
 
-  virtual bool not_found(std::string, mode_t*)
+  virtual bool not_found(std::string, mode_t*, Cold*)
   {
     return false;
   }
@@ -326,10 +383,15 @@ struct CoolDir : public Hot {
     return new Hot(path, cold, version);
   }
 
+  virtual bool visible(Cold* cold)
+  {
+    return cold->visible(version);
+  }
+
   virtual Hot* lookup(std::string name, mode_t *create = nullptr)
   {
   again:
-    int content_fd = get_readdir_fd();
+    int content_fd = (create && !S_ISDIR(*create))? get_writable_fd() : get_readdir_fd();
     if (content_fd < 0)
       return nullptr;
     int fd = ::openat(content_fd, name.c_str(), O_DIRECTORY);
@@ -345,27 +407,27 @@ struct CoolDir : public Hot {
       } else {
 	throw Errno(EINVAL);
       }
-      ::close(content_fd);
       ::close(fd);
       goto again;
     }
     ::close(child_content_fd);
 
     if (fd < 0) {
-      if (not_found(name, create))
+      if (not_found(name, create, nullptr))
 	goto again;
       return nullptr;
     }
 
     Cold* cold = new_cold(fd);
-    if (cold->visible(version))
+    if (visible(cold))
       return new_hot(path + "/" + name, cold, version);
-    delete cold;
-    if (not_found(name, create)) {
+    if (not_found(name, create, cold)) {
+      delete cold;
       ::close(content_fd);
       ::close(fd);
       goto again;
     }
+    delete cold;
     return nullptr;
   }
 
@@ -425,7 +487,7 @@ struct HotDir : public WarmDir {
     return new Hot(path + "/" + name, cold, version);
   }
 
-  virtual bool not_found(std::string file, mode_t*)
+  virtual bool not_found(std::string file, mode_t*, Cold*)
   {
     if (version == "hot") {
       std::cerr << "not found: " << file << std::endl;
@@ -476,7 +538,20 @@ struct VirtualDir : public CoolDir {
 };
 
 struct NewsDir : public HotDir {
-  virtual bool not_found(std::string file, mode_t*)
+  virtual Hot* new_hot(std::string name, Cold* cold, std::string version)
+  {
+    if (cold->is_dir(version))
+      return new NewsDir(path + "/" + name, cold, version);
+    return new Hot(path + "/" + name, cold, version);
+  }
+
+  virtual bool visible(Cold* cold)
+  {
+    return (cold->visible(version) &&
+	    !cold->is_link(version));
+  }
+
+  virtual bool not_found(std::string file, mode_t*, Cold*)
   {
     return false;
   }
@@ -488,7 +563,20 @@ struct NewsDir : public HotDir {
 };
 
 struct DepsDir : public HotDir {
-  virtual bool not_found(std::string file, mode_t*)
+  virtual Hot* new_hot(std::string name, Cold* cold, std::string version)
+  {
+    if (cold->is_dir(version))
+      return new DepsDir(path + "/" + name, cold, version);
+    return new Hot(path + "/" + name, cold, version);
+  }
+
+  virtual bool visible(Cold* cold)
+  {
+    return (cold->visible(version) &&
+	    cold->is_link(version));
+  }
+
+  virtual bool not_found(std::string file, mode_t*, Cold*)
   {
     return false;
   }
@@ -501,15 +589,19 @@ struct DepsDir : public HotDir {
 
 struct OverlayDir : public CoolDir {
   std::string fallback;
-  virtual bool not_found(std::string file, mode_t*)
+  virtual bool not_found(std::string file, mode_t* create, Cold* cold)
   {
-    CoolDir dir("tmp/" + path, cold, "hot");
+    CoolDir dir("tmp/" + path, this->cold, "hot");
     Hot* hot = dir.lookup(file);
-    if (hot) {
-      hot->cold->create_version(version, "hot");
-      return true;
+    if (!create) {
+      if (cold)
+	cold->create_version(version, fallback);
+      else {
+	::mkdirat(get_content_fd(), file.c_str(), dir_mode);
+	return true;
+      }
     }
-    return false;
+    return hot != nullptr;
   }
 
   OverlayDir(std::string path, Cold* cold, std::string version, std::string fallback)
@@ -521,7 +613,7 @@ struct OverlayDir : public CoolDir {
 struct BuildDir : public VirtualDir {
   std::string fallback;
 
-  virtual bool not_found(std::string file, mode_t*)
+  virtual bool not_found(std::string file, mode_t*, Cold*)
   {
     return false;
   }
@@ -628,6 +720,25 @@ void Hot::fuse_getattr(fuse_req_t req, fuse_ino_t ino, fuse_file_info*)
   }
 }
 
+void Hot::fuse_setattr(fuse_req_t req, fuse_ino_t ino, struct stat* attr,
+		       int valid, fuse_file_info* fi)
+{
+  try {
+    Hot& hot = from_inode(ino);
+
+    if (valid & FUSE_SET_ATTR_MODE)
+      hot.set_mode(attr->st_mode);
+    if (valid & FUSE_SET_ATTR_MTIME) {
+      if (valid & FUSE_SET_ATTR_MTIME_NOW)
+	hot.set_mtime();
+      hot.set_mtime(attr->st_mtim);
+    }
+    return fuse_getattr(req, ino, fi);
+  } catch (Errno error) {
+    fuse_reply_err(req, error.error);
+  }
+}
+
 void CoolDir::fuse_readdirplus(fuse_req_t req, fuse_ino_t ino, size_t size,
 		       off_t notreallyanoffset, fuse_file_info*)
 {
@@ -695,6 +806,8 @@ void CoolDir::fuse_create(fuse_req_t req, fuse_ino_t ino, const char *string,
     Hot* hot = dir.lookup(name, &mode);
     if (!hot)
       throw Errno();
+    if (hot->is_nonexistent())
+      std::cerr << "nonexistent file created" << std::endl;
     fuse_reply_create(req, hot->get_fuse_entry_param(), fi);
   } catch (Errno error) {
     fuse_reply_err(req, error.error);
@@ -748,6 +861,7 @@ void Hot::fuse_write_buf(fuse_req_t req, fuse_ino_t ino, fuse_bufvec *in_buf,
 static fuse_lowlevel_ops fuse_operations = {
   .lookup = CoolDir::fuse_lookup,
   .getattr = Hot::fuse_getattr,
+  .setattr = Hot::fuse_setattr,
   .mkdir = CoolDir::fuse_mkdir,
   .rmdir = CoolDir::fuse_rmdir,
   .open = Hot::fuse_open,

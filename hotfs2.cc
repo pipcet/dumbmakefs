@@ -51,6 +51,8 @@ void fs_delete_recursively_at(int fd, std::string path)
 
   int dirfd;
   DIR *dir = fdopendir (dirfd = ::openat (fd, path.c_str(), O_DIRECTORY));
+  if (!dir)
+    return;
   struct dirent *dirent;
   while ((dirent = readdir(dir))) {
     std::string name(dirent->d_name);
@@ -1090,6 +1092,15 @@ static bool build_file(std::string file)
 void BuildDir::delete_version()
 {
   VirtualDir::delete_version();
+  for (const auto& n : by_path) {
+    auto hot = n.second;
+    if (hot == this)
+      continue;
+    if (hot->version == version) {
+      hot->delete_version();
+      delete hot;
+    }
+  }
   ::unlinkat(hot_root->cold->dir_fd, ("builds/" + version).c_str(),
 	     AT_REMOVEDIR);
 }

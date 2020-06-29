@@ -406,6 +406,7 @@ struct CoolDir : public Hot {
   static void fuse_lookup(fuse_req_t req, fuse_ino_t parent, const char *name);
   static void fuse_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name,
 			 mode_t mode);
+  static void fuse_unlink(fuse_req_t req, fuse_ino_t parent, const char *name);
   static void fuse_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name);
   static void fuse_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 			  mode_t mode, fuse_file_info*);
@@ -860,6 +861,7 @@ void CoolDir::fuse_mkdir(fuse_req_t req, fuse_ino_t ino, const char *string,
     fuse_reply_err(req, error.error);
   }
 }
+
 void CoolDir::fuse_rmdir(fuse_req_t req, fuse_ino_t ino, const char *string)
 {
   std::string name(string);
@@ -876,6 +878,24 @@ void CoolDir::fuse_rmdir(fuse_req_t req, fuse_ino_t ino, const char *string)
     fuse_reply_err(req, error.error);
   }
 }
+
+void CoolDir::fuse_unlink(fuse_req_t req, fuse_ino_t ino, const char *string)
+{
+  std::string name(string);
+  try {
+    CoolDir& dir = CoolDir::from_inode(ino);
+    Hot* hot = dir.lookup(name);
+    if (!hot) {
+      fuse_reply_err(req, 0);
+      return;
+    }
+    hot->delete_version();
+    fuse_reply_err(req, 0);
+  } catch (Errno error) {
+    fuse_reply_err(req, error.error);
+  }
+}
+
 void CoolDir::fuse_create(fuse_req_t req, fuse_ino_t ino, const char *string,
 			  mode_t mode, fuse_file_info* fi)
 {
@@ -942,6 +962,7 @@ static fuse_lowlevel_ops fuse_operations = {
   .getattr = Hot::fuse_getattr,
   .setattr = Hot::fuse_setattr,
   .mkdir = CoolDir::fuse_mkdir,
+  .unlink = CoolDir::fuse_unlink,
   .rmdir = CoolDir::fuse_rmdir,
   .open = Hot::fuse_open,
   .read = Hot::fuse_read,
